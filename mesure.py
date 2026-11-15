@@ -1,5 +1,5 @@
 cat > ~/clock.py <<'EOF'
-import glob, json, math, os, re, threading, time, urllib.request
+import glob, json, math, os, re, sqlite3, threading, time, urllib.request
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +37,18 @@ PM_WARM_S = 30         # fan + laser warm-up before every measurement
 PM_SAMPLE_S = 10       # one measurement = average of the ~10 frames of 10 s (1 frame/s)
 SDS_PORT = os.environ.get("SDS_PORT")        # optional: force a port, e.g. /dev/ttyUSB0
 FILE_PM = os.path.expanduser("~/history_pm.json")
+INCIDENT_DB = os.path.expanduser("~/incidents.sqlite3")
+INCIDENT_LABELS = ("clean", "cleaning", "smoking", "fire")
+INCIDENT_DISCARDED = "nc"
+INCIDENT_CONTEXT_N = 3
+INCIDENT_MIN_RISE_UGM3 = 10.0
+INCIDENT_MIN_RISE_RATIO = 1.25
+INCIDENT_TRANSIENT_RISE_UGM3 = 30.0
+INCIDENT_TRANSIENT_RISE_RATIO = 2.0
+INCIDENT_PM25_HIGH_UGM3 = 35.5
+INCIDENT_PM10_HIGH_UGM3 = 155.0
+INCIDENT_VALIDATION_MIN_N = 8
+INCIDENT_DEDUP_S = PM_LOG_S
 
 # Reference pollution, PM2.5 and PM10 each handled on their own:
 #   1) OFFICIAL station "Lisice" of the Ministry of Environment (MOEPP), relayed by aqicn.org (WAQI)
@@ -45,8 +57,7 @@ FILE_PM = os.path.expanduser("~/history_pm.json")
 #      model fills in -> drawn DOTTED and marked with *  (model data, NOT government-measured)
 #   so a line can look like  ----(official)----(official)....(model)
 WAQI_IDX = 8106
-WAQI_TOKEN_DEFAULT = "5239ac77040e519133b5906004e8afad064cffba"     # your own token
-WAQI_TOKEN_FILE = os.path.expanduser("~/.waqi_token")                # (file or WAQI_TOKEN env override it)
+WAQI_TOKEN_FILE = os.path.expanduser("~/.waqi_token")
 REF_PM_S = 600
 # model values are shown per clock hour (12:00-12:59) until the station publishes that hour, then replaced
 REF_STALE_S = 3 * 3600 # a reference value older than this is shown as N/A
@@ -135,6 +146,274 @@ def add_pm(p25, p10):
         hist_pm.append([now, p25, p10])
         hist_pm[:] = [p for p in hist_pm if now - p[0] <= WINDOW_S]
         maybe_save_pm(now)
+    detect_logged_incidents()
+
+def init_incidents():
+    with sqlite3.connect(INCIDENT_DB) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS incidents (
+            id INTEGER PRIMARY KEY,
+            event_ts REAL NOT NULL,
+            samples TEXT NOT NULL,
+            label TEXT,
+            created_ts REAL NOT NULL,
+            detection_reason TEXT
+        )""")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(incidents)")}
+        if "detection_reason" not in columns:
+            db.execute("ALTER TABLE incidents ADD COLUMN detection_reason TEXT")
+
+def incident_samples(event_ts):
+    with lock:
+        points = [p for p in hist_pm if p[1] is not None and p[2] is not None
+                  and math.isfinite(p[1]) and math.isfinite(p[2])]
+    before = [p for p in points if p[0] < event_ts][-INCIDENT_CONTEXT_N:]
+    after = [p for p in points if p[0] >= event_ts][:INCIDENT_CONTEXT_N]
+    if len(before) != INCIDENT_CONTEXT_N or len(after) != INCIDENT_CONTEXT_N:
+        raise ValueError("Need three local PM readings before and three after the incident time. "
+                         "The SDS011 logs about every 10 minutes; wait for three readings after the event.")
+    return before + after
+
+def get_incidents():
+    with sqlite3.connect(INCIDENT_DB) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT id, event_ts, samples, label, detection_reason "
+            "FROM incidents ORDER BY event_ts DESC, id DESC"
+        ).fetchall()
+    return [{"id": row["id"], "ts": row["event_ts"],
+             "samples": json.loads(row["samples"]), "label": row["label"],
+             "reason": row["detection_reason"]} for row in rows]
+
+def incident_sample_parts(samples):
+    if isinstance(samples, dict):
+        return samples["before"], samples["after"]
+    context_n = len(samples) // 2
+    return samples[:context_n], samples[context_n:]
+
+def incident_features(samples):
+    features = []
+    before, after = incident_sample_parts(samples)
+    for column in (1, 2):
+        baseline = sum(point[column] for point in before) / len(before)
+        features.append(math.log1p(max(0, baseline)))
+        scale = max(baseline, 5.0)
+        changes = [(point[column] - baseline) / scale for point in after]
+        peak_index = max(range(len(changes)), key=changes.__getitem__)
+        features.extend((max(changes), peak_index / max(1, len(changes) - 1), changes[-1]))
+    return features
+
+def incident_metrics(samples):
+    before, after = incident_sample_parts(samples)
+    metrics = []
+    for column, name in ((1, "PM2.5"), (2, "PM10")):
+        baseline = sum(point[column] for point in before) / len(before)
+        peak = max(after, key=lambda point: point[column])
+        rise = peak[column] - baseline
+        peak_offset = max(0, round((peak[0] - after[0][0]) / 60))
+        metrics.append("%s baseline %.1f → peak %.1f (rise %+.1f, +%d min)" % (
+            name, baseline, peak[column], rise, peak_offset))
+    return "; ".join(metrics)
+
+def incident_rise_detected(samples):
+    before, after = incident_sample_parts(samples)
+    baseline = [sum(point[column] for point in before) / len(before) for column in (1, 2)]
+    pollutant_names = ("PM2.5", "PM10")
+    high_levels = (INCIDENT_PM25_HIGH_UGM3, INCIDENT_PM10_HIGH_UGM3)
+
+    for column, (value, name) in enumerate(zip(baseline, pollutant_names), start=1):
+        transient_threshold = max(value + INCIDENT_TRANSIENT_RISE_UGM3,
+                                  value * INCIDENT_TRANSIENT_RISE_RATIO)
+        if after[0][column] >= transient_threshold:
+            return "Transient %s spike to %.1f µg/m³" % (name, after[0][column])
+
+    for column, (high_level, name) in enumerate(zip(high_levels, pollutant_names), start=1):
+        if (before[-1][column] < high_level <= after[0][column]
+                and sum(point[column] >= high_level for point in after) >= 2):
+            return "Sustained %s high level (>= %.1f µg/m³)" % (name, high_level)
+
+    for column, (value, name) in enumerate(zip(baseline, pollutant_names), start=1):
+        threshold = max(value + INCIDENT_MIN_RISE_UGM3, value * INCIDENT_MIN_RISE_RATIO)
+        if len(before) < INCIDENT_CONTEXT_N:
+            continue
+        if (after[0][column] >= threshold
+                and sum(point[column] >= threshold for point in after) >= 2):
+            return "Sustained %s rise (>= %.1f µg/m³ and %.2fx baseline)" % (
+                name, INCIDENT_MIN_RISE_UGM3, INCIDENT_MIN_RISE_RATIO)
+    return None
+
+def detect_logged_incidents():
+    with lock:
+        points = [p for p in hist_pm if p[1] is not None and p[2] is not None
+                  and math.isfinite(p[1]) and math.isfinite(p[2])]
+    incidents = get_incidents()
+    existing_times = [item["ts"] for item in incidents]
+    for index in range(1, len(points) - INCIDENT_CONTEXT_N + 1):
+        before = points[max(0, index - INCIDENT_CONTEXT_N):index]
+        after = points[index:index + INCIDENT_CONTEXT_N]
+        samples = (before + after if len(before) == INCIDENT_CONTEXT_N
+                   else {"before": before, "after": after})
+        event_ts = points[index][0]
+        reason = incident_rise_detected(samples)
+        if reason is None:
+            continue
+        if any(abs(event_ts - existing_ts) <= INCIDENT_DEDUP_S for existing_ts in existing_times):
+            continue
+        with sqlite3.connect(INCIDENT_DB) as db:
+            db.execute(
+                "INSERT INTO incidents "
+                "(event_ts, samples, label, created_ts, detection_reason) "
+                "VALUES (?, ?, NULL, ?, ?)",
+                (event_ts, json.dumps(samples), time.time(), reason))
+        existing_times.append(event_ts)
+
+def classify_incident(incident, incidents):
+    training = [item for item in incidents
+                if item["label"] in INCIDENT_LABELS and item["id"] != incident["id"]]
+    if len(training) < 4:
+        return {"label": None, "votes": 0, "neighbors": [],
+                "reason": "Needs at least four labeled examples"}
+    if len({item["label"] for item in training}) < 2:
+        return {"label": None, "votes": 0, "neighbors": [],
+                "reason": "Needs examples from at least two classes"}
+
+    vectors = [(item, incident_features(item["samples"])) for item in training]
+    columns = zip(*(vector for _, vector in vectors))
+    scales = [math.sqrt(sum((value - sum(col) / len(col)) ** 2 for value in col) / len(col))
+              for col in columns]
+    if not any(scale > 1e-9 for scale in scales):
+        return {"label": None, "votes": 0, "neighbors": [],
+                "reason": "No variation in labeled examples"}
+    features = incident_features(incident["samples"])
+    distances = []
+    for item, vector in vectors:
+        distance = math.sqrt(sum(((a - b) / scale) ** 2 if scale > 1e-9 else 0
+                                 for a, b, scale in zip(features, vector, scales)))
+        distances.append((distance, item["label"], item["ts"]))
+    nearest = sorted(distances)[:3]
+    votes = {}
+    for _, label, _ in nearest:
+        votes[label] = votes.get(label, 0) + 1
+    winner, count = sorted(votes.items(), key=lambda item: (-item[1], item[0]))[0]
+    return {
+        "label": winner if count >= 2 else None,
+        "votes": count,
+        "neighbors": [(label, ts) for _, label, ts in nearest],
+        "reason": None if count >= 2 else "No neighbor majority",
+    }
+
+def predict_incident(incident, incidents):
+    result = classify_incident(incident, incidents)
+    return result["label"] if result else None
+
+def evaluate_classifier(incidents):
+    labeled = [item for item in incidents if item["label"] in INCIDENT_LABELS]
+    classes = {item["label"] for item in labeled}
+    if len(labeled) < INCIDENT_VALIDATION_MIN_N or len(classes) < 2:
+        return ("Leave-one-out check available after at least %d labeled incidents "
+                "across two or more classes." % INCIDENT_VALIDATION_MIN_N)
+
+    results = [(item["label"], classify_incident(item, labeled)) for item in labeled]
+    confident = [(actual, result["label"]) for actual, result in results
+                 if result is not None and result["label"] is not None]
+    if not confident:
+        return "Leave-one-out check: no confident predictions; abstained on all %d examples." % len(labeled)
+    correct = sum(actual == predicted for actual, predicted in confident)
+    abstained = len(labeled) - len(confident)
+    return ("Leave-one-out check: %d/%d correct among %d confident predictions; "
+            "%d/%d abstained." % (
+                correct, len(confident), len(confident), abstained, len(labeled)))
+
+def incident_page(message=""):
+    incidents = get_incidents()
+    now = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M")
+    rows = []
+    for item in incidents:
+        classification = classify_incident(item, incidents)
+        before_samples, after_samples = incident_sample_parts(item["samples"])
+        before = "".join(
+            "<li>%s — %.1f / %.1f</li>" % (
+                datetime.fromtimestamp(point[0]).strftime("%H:%M"), point[1], point[2])
+            for point in before_samples)
+        after = "".join(
+            "<li>%s — %.1f / %.1f</li>" % (
+                datetime.fromtimestamp(point[0]).strftime("%H:%M"), point[1], point[2])
+            for point in after_samples)
+        options = ['<option value="">Unlabelled</option>']
+        options.extend('<option value="%s"%s>%s</option>' % (
+            label, " selected" if item["label"] == label else "", label.title())
+            for label in INCIDENT_LABELS)
+        options.append('<option value="%s"%s>NC — discard from training</option>' % (
+            INCIDENT_DISCARDED,
+            " selected" if item["label"] == INCIDENT_DISCARDED else ""))
+        if item["label"] == INCIDENT_DISCARDED:
+            predicted = "Marked NC"
+        elif classification and classification["neighbors"]:
+            neighbors = ", ".join(
+                "%s %s" % (label.title(), datetime.fromtimestamp(ts).strftime("%H:%M"))
+                for label, ts in classification["neighbors"])
+            if classification["label"]:
+                predicted = "%s (%d/3 neighbor votes; nearest: %s)" % (
+                    classification["label"].title(), classification["votes"], neighbors)
+            else:
+                predicted = "Undetermined (%d/3; nearest: %s)" % (
+                    classification["votes"], neighbors)
+        elif classification:
+            predicted = "Undetermined (%s)" % escape(classification["reason"])
+        else:
+            predicted = "Undetermined"
+        rows.append(
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td><ol>%s</ol></td><td><ol>%s</ol></td>"
+            '<td><form method="post" action="/incidents/label">'
+            '<input type="hidden" name="id" value="%d">'
+            '<select name="label">%s</select> <button type="submit">Save label</button></form></td>'
+            "<td>%s</td></tr>" % (
+                datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M"),
+                escape(item["reason"] or "Manual / earlier log"),
+                escape(incident_metrics(item["samples"])),
+                before, after, item["id"], "".join(options), predicted))
+    message_html = '<p class="message">%s</p>' % escape(message) if message else ""
+    table_rows = "".join(rows) or '<tr><td colspan="7">No incidents recorded yet.</td></tr>'
+    validation = escape(evaluate_classifier(incidents))
+    return """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>Air incidents</title>
+<style>
+body{font:16px sans-serif;margin:1.5rem;line-height:1.4}main{max-width:1200px;margin:auto}
+form.add{display:flex;gap:.7rem;align-items:end;flex-wrap:wrap;margin:1.5rem 0}
+label{display:grid;gap:.3rem}table{border-collapse:collapse;width:100%%;text-align:left}
+th,td{border:1px solid #8888;padding:.5rem;vertical-align:top}ol{margin:0;padding-left:1.5rem}
+.message{padding:.7rem;background:#b54b3322;border:1px solid #b54b33}
+.note{opacity:.8}.scroll{overflow-x:auto}
+</style></head><body><main>
+<p><a href="/">← Dashboard</a></p><h1>Local air-quality incidents</h1>
+<p class="note">Incidents normally store the three PM2.5/PM10 readings before and after their time.
+For a very large transient, the detector can use fewer available readings before the spike. The sensor logs
+about every 10 minutes, so add an incident manually after the three following readings arrive (about 20 minutes).
+Readings come only from this Pi's SDS011. Records and labels are stored locally
+in ~/incidents.sqlite3 and are not automatically deleted. Select an incident from the last four hours
+of sensor history.</p>
+%s
+<form class="add" method="post" action="/incidents/add">
+<label>Incident date and time (Pi local time)
+<input type="datetime-local" name="event_time" value="%s" required></label>
+<button type="submit">Save incident readings</button></form>
+<p class="note">The local 3-nearest-neighbour classifier needs at least four labelled examples across
+at least two classes. It predicts only when at least two neighbours agree; early results are experimental
+and are not a fire or safety alarm. Neighbor votes are agreement counts, not calibrated probabilities.
+The app scans its saved four-hour sensor history on startup and checks
+new readings for a rise in PM2.5 or PM10: a single transient must be at least 30 µg/m³ and 2× baseline;
+for this transient, it uses the one to three preceding readings available. Smaller rises must be at least
+10 µg/m³ and 1.25× baseline in two of three readings and require all three baseline readings. A sustained
+crossing to PM2.5 >=35.5 or PM10 >=155 µg/m³ also records a high-level event when two of three readings
+remain high after a lower reading. These short-term thresholds are screening rules, not official AQI
+measurements. All detected events are saved, including undetermined ones. Choose a class or mark a false
+positive NC to exclude it from classifier training; nearby duplicate detections are ignored.</p>
+<p class="note">%s</p>
+<div class="scroll"><table><thead><tr><th>Incident time</th><th>Detection reason</th><th>Peak summary</th>
+<th>Before<br>(PM2.5 / PM10 µg/m³)</th><th>After<br>(PM2.5 / PM10 µg/m³)</th>
+<th>Your classification</th><th>Prediction / nearest examples</th></tr></thead>
+<tbody>%s</tbody></table></div></main></body></html>""" % (
+        message_html, now, validation, table_rows)
 
 def set_live(t, h):
     with lock:
@@ -340,7 +619,7 @@ def waqi_token():
                 t = f.read()
         except Exception:
             t = None
-    t = t.strip() if t and t.strip() else WAQI_TOKEN_DEFAULT
+    t = t.strip() if t and t.strip() else None
     return t or None
 
 def fetch_pm_official(token):
@@ -645,6 +924,7 @@ svg.chart{touch-action:pan-y;-webkit-user-select:none;user-select:none}
 <div id="main">
 <div class="ctl"><span>Window:</span>
 <button data-w="1" class="@B1@">1 h</button><button data-w="2" class="@B2@">2 h</button><button data-w="4" class="@B4@">4 h</button>
+<a href="/incidents">Incident log</a>
 <span class="hint">click a coloured value to hide / show its line &nbsp;·&nbsp; hover or tap any dot for details &nbsp;·&nbsp; ● measured &nbsp; ○ model*</span></div>
 <div style="font-size:1.1rem;display:flex;justify-content:center;gap:.4rem 1.2rem;flex-wrap:wrap;margin-bottom:4px">
 <b id="c">--:--:--</b><span>CPU: @CPU@</span>
@@ -805,6 +1085,15 @@ class H(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        if u.path == "/incidents":
+            body = incident_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         q = parse_qs(u.query)                 # ?w=1|2|4 (hours shown)  &hide=t,h,p25,... (lines switched off)
         try:
             w = int(q.get("w", ["4"])[0])
@@ -882,10 +1171,50 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ("/incidents/add", "/incidents/label"):
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 4096:
+                raise ValueError("Invalid form size.")
+            form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            if path == "/incidents/add":
+                event_time = datetime.fromisoformat(form.get("event_time", [""])[0])
+                event_ts = event_time.timestamp()
+                samples = incident_samples(event_ts)
+                with sqlite3.connect(INCIDENT_DB) as db:
+                    db.execute(
+                        "INSERT INTO incidents "
+                        "(event_ts, samples, created_ts, detection_reason) VALUES (?, ?, ?, ?)",
+                        (event_ts, json.dumps(samples), time.time(), "Manual entry"))
+            else:
+                incident_id = int(form.get("id", [""])[0])
+                label = form.get("label", [""])[0] or None
+                if label is not None and label not in INCIDENT_LABELS + (INCIDENT_DISCARDED,):
+                    raise ValueError("Choose one of the listed classes or NC.")
+                with sqlite3.connect(INCIDENT_DB) as db:
+                    result = db.execute(
+                        "UPDATE incidents SET label = ? WHERE id = ?", (label, incident_id))
+                    if result.rowcount == 0:
+                        self.send_error(404, "Incident not found.")
+                        return
+        except (ValueError, UnicodeDecodeError) as exc:
+            self.send_error(400, str(exc))
+            return
+        self.send_response(303)
+        self.send_header("Location", "/incidents")
+        self.end_headers()
+
     def log_message(self, *a): pass
 
 if __name__ == "__main__":
     load()
+    init_incidents()
+    detect_logged_incidents()
     threading.Thread(target=reader, daemon=True).start()
     threading.Thread(target=ref_loop, daemon=True).start()
     threading.Thread(target=pm_reader, daemon=True).start()
