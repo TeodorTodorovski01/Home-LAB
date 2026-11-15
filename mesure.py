@@ -40,7 +40,13 @@ PM_SAMPLE_S = 10       # one measurement = average of the ~10 frames of 10 s (1 
 SDS_PORT = os.environ.get("SDS_PORT")        # optional: force a port, e.g. /dev/ttyUSB0
 FILE_PM = os.path.expanduser("~/history_pm.json")
 INCIDENT_DB = os.path.expanduser("~/incidents.sqlite3")
-INCIDENT_LABELS = ("clean", "cleaning", "smoking", "fire")
+INCIDENT_LABELS = ("general_pollution", "cleaning", "smoking", "fire")
+INCIDENT_LABEL_TITLES = {
+    "general_pollution": "General pollution",
+    "cleaning": "Cleaning",
+    "smoking": "Smoking",
+    "fire": "Fire",
+}
 INCIDENT_DISCARDED = "nc"
 INCIDENT_CONTEXT_N = 5
 INCIDENT_MIN_RISE_UGM3 = 5.0
@@ -163,6 +169,9 @@ def init_incidents():
         columns = {row[1] for row in db.execute("PRAGMA table_info(incidents)")}
         if "detection_reason" not in columns:
             db.execute("ALTER TABLE incidents ADD COLUMN detection_reason TEXT")
+        db.execute(
+            "UPDATE incidents SET label = 'general_pollution' WHERE lower(label) = 'clean'"
+        )
 
 def incident_samples(event_ts):
     with lock:
@@ -375,7 +384,7 @@ def incident_page(message=""):
             for point in after_samples)
         options = ['<option value="">Unlabelled</option>']
         options.extend('<option value="%s"%s>%s</option>' % (
-            label, " selected" if item["label"] == label else "", label.title())
+            label, " selected" if item["label"] == label else "", INCIDENT_LABEL_TITLES[label])
             for label in INCIDENT_LABELS)
         options.append('<option value="%s"%s>NC — discard from training</option>' % (
             INCIDENT_DISCARDED,
@@ -384,11 +393,12 @@ def incident_page(message=""):
             predicted = "Marked NC"
         elif classification and classification["neighbors"]:
             neighbors = ", ".join(
-                "%s %s" % (label.title(), datetime.fromtimestamp(ts).strftime("%H:%M"))
+                "%s %s" % (INCIDENT_LABEL_TITLES[label], datetime.fromtimestamp(ts).strftime("%H:%M"))
                 for label, ts in classification["neighbors"])
             if classification["label"]:
                 predicted = "%s (%d/3 neighbor votes; nearest: %s)" % (
-                    classification["label"].title(), classification["votes"], neighbors)
+                    INCIDENT_LABEL_TITLES[classification["label"]],
+                    classification["votes"], neighbors)
             else:
                 predicted = "Undetermined (%d/3; nearest: %s)" % (
                     classification["votes"], neighbors)

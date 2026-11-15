@@ -151,8 +151,9 @@ On the incident page:
 2. Click **Save incident readings**. Manual entries require five PM readings
    before and after the selected time. With the current sampling period, allow
    about 40–50 minutes for five readings after the event.
-3. In the table, choose **Clean**, **Cleaning**, **Smoking**, or **Fire** from
-   the dropdown and save the label.
+3. In the table, choose **General pollution**, **Cleaning**, **Smoking**, or
+   **Fire** from the dropdown and save the label. Use General pollution for a
+   real pollution event whose specific source is unknown.
 4. Choose **NC — discard from training** for a false positive. This keeps the
    incident record but excludes it from classifier examples.
 
@@ -187,7 +188,8 @@ ordinary readings to discover events by itself. Replacing the candidate
 detector later would require labeled **no-event** windows as well as examples
 of each event class, followed by validation on separate readings. The current
 **NC** option only excludes a candidate from training; it is not a no-event
-training class.
+training class. Existing **Clean** labels are migrated to **General pollution**
+when the app starts, preserving those training examples.
 
 ## Local files and retention
 
