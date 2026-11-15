@@ -201,15 +201,23 @@ app:
 | `~/clock.py` | Generated Python application | Until replaced |
 | `~/history1m.json` | DHT temperature/humidity history | Rolling four hours |
 | `~/history_pm.json` | SDS011 and pollution reference history | Local PM readings: rolling five days; references: rolling four hours |
+| `~/telemetry_archive.jsonl` | Append-only local DHT11 and SDS011 readings, one JSON record per sample | Kept on the Pi until you remove or back up the file |
 | `~/incidents.sqlite3` | Incident readings, detection reason, and labels | Kept until you remove or back up the file |
 | `~/.waqi_token` | Optional private WAQI token | Kept until you remove the file |
 
-The five-day local PM log is scanned after a restart. Incidents already saved
-in SQLite remain there; raw PM measurements older than the rolling five-day
-history are not archived by this application. The dashboard still displays
-its selected one-to-four-hour graph window. The five-day window starts filling
-after this version is deployed; readings already removed by the old four-hour
-retention cannot be recovered.
+The telemetry archive is appended immediately after each successful local
+sensor reading, so it does not wait for an hourly upload and does not overwrite
+older records. It contains only the Pi's DHT11 and SDS011 readings, not the
+external reference feeds. The archive is local to the Pi and is not pushed to
+GitHub automatically; back it up somewhere private if you need a second copy.
+It starts collecting when this version runs and cannot reconstruct old readings
+that have already expired from the rolling history.
+
+The five-day local PM log is scanned after a restart, while the dashboard
+still displays its selected one-to-four-hour graph window. The permanent
+archive starts when this version is deployed; it does not backfill readings
+from before deployment. Incidents and labels already saved in SQLite remain
+there independently of both sensor-history files.
 
 ## Troubleshooting
 

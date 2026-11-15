@@ -1,5 +1,5 @@
 cat > ~/clock.py <<'EOF'
-import glob, json, math, os, re, sqlite3, threading, time, urllib.request
+import glob, json, math, os, re, sqlite3, sys, threading, time, urllib.request
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +18,7 @@ PM_HISTORY_S = 5 * 24 * 3600  # keep five days of local PM data for incident rev
 GRID_S = 300           # grid every 5 min
 SAVE_S = 300           # save to disk every 5 min (saves the SD card)
 FILE = os.path.expanduser("~/history1m.json")
+TELEMETRY_ARCHIVE_FILE = os.path.expanduser("~/telemetry_archive.jsonl")
 
 # Reference weather: Open-Meteo (weather service MODEL data, not a measurement*), Aerodrom, Skopje
 LAT, LON = 41.98, 21.47
@@ -85,6 +86,7 @@ C_P25, C_P10 = "#9c27b0", "#43a047"      # sensor: purple PM2.5, green PM10
 C_RP25, C_RP10 = "#ec407a", "#afb42b"    # reference: pink PM2.5, olive PM10
 
 lock = threading.Lock()
+archive_lock = threading.Lock()
 live = {"t": None, "h": None}
 hist = []              # [ts, temp, humidity]
 ref = {"pts": [], "t": None, "h": None, "ts": None, "dt": None}
@@ -134,6 +136,14 @@ def maybe_save_pm(now):          # call with the lock held
         except Exception:
             pass
 
+def append_telemetry(record):
+    try:
+        with archive_lock:
+            with open(TELEMETRY_ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        print("Telemetry archive write failed: %s" % exc, file=sys.stderr)
+
 def add(t, h):
     now = time.time()
     with lock:
@@ -146,6 +156,10 @@ def add(t, h):
                 last_save[0] = now
             except Exception:
                 pass
+    append_telemetry({
+        "ts": now, "source": "dht11",
+        "temperature_c": t, "humidity_pct": h,
+    })
 
 def add_pm(p25, p10):
     now = time.time()
@@ -154,6 +168,10 @@ def add_pm(p25, p10):
         hist_pm.append([now, p25, p10])
         hist_pm[:] = [p for p in hist_pm if now - p[0] <= PM_HISTORY_S]
         maybe_save_pm(now)
+    append_telemetry({
+        "ts": now, "source": "sds011",
+        "pm25_ugm3": p25, "pm10_ugm3": p10,
+    })
     detect_logged_incidents()
 
 def init_incidents():
