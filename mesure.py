@@ -1,21 +1,23 @@
 cat > ~/clock.py <<'EOF'
-import glob, json, math, os, threading, time, urllib.request
+import glob, json, math, os, re, threading, time, urllib.request
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 import board, adafruit_dht
 try:
     import serial          # pyserial, needed for the SDS011 (sudo apt install python3-serial)
 except ImportError:
     serial = None
 
-READ_S = 600           # sensor read + log every 10 min (same as reference)
+READ_S = 600           # log one temperature/humidity point every 10 min (same as reference)
+DHT_N = 4              # each point = average of 4 readings taken 2.5 min apart (1 = no averaging)
 WINDOW_S = 4 * 3600    # graph window (4 hours)
 GRID_S = 300           # grid every 5 min
 SAVE_S = 300           # save to disk every 5 min (saves the SD card)
 FILE = os.path.expanduser("~/history1m.json")
 
-# Reference weather: Open-Meteo (national weather service models), Aerodrom, Skopje
+# Reference weather: Open-Meteo (weather service MODEL data, not a measurement*), Aerodrom, Skopje
 LAT, LON = 41.98, 21.47
 REF_S = 600            # refresh reference every 10 min
 REF_URL = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
@@ -28,19 +30,26 @@ C_T, C_H = "#e53935", "#1e88e5"      # sensor: red temp, blue humidity
 C_RT, C_RH = "#fb8c00", "#00bcd4"    # reference: orange temp, cyan humidity
 
 # ---------------- air quality: SDS011 (Nova PM sensor) ----------------
-PM_S = 300             # PM read + log every 5 min
-PM_WARM_S = 30         # fan + laser warm-up before reading
-PM_SAMPLE_S = 10       # then average ~10 frames (1 frame/s)
+PM_LOG_S = 600         # log one PM point every 10 min (same as the reference)
+PM_N = 4               # each point = (sum of 4 measurements taken 2.5 min apart) / 4
+PM_MIN_OK = 2          # fewer valid measurements than this -> no point is logged
+PM_WARM_S = 30         # fan + laser warm-up before every measurement
+PM_SAMPLE_S = 10       # one measurement = average of the ~10 frames of 10 s (1 frame/s)
 SDS_PORT = os.environ.get("SDS_PORT")        # optional: force a port, e.g. /dev/ttyUSB0
 FILE_PM = os.path.expanduser("~/history_pm.json")
 
-# Reference pollution: OFFICIAL station "Lisice" of the Ministry of Environment (MOEPP) of North
-# Macedonia, 41deg58'42"N 21deg28'12"E = the same spot as LAT/LON above. Fetched through the World
-# Air Quality Index project (aqicn.org), which relays the MOEPP feed (free token, see WAQI_TOKEN_FILE).
-# No token / feed down -> automatic fallback to the Open-Meteo CAMS model (not a station!).
+# Reference pollution, PM2.5 and PM10 each handled on their own:
+#   1) OFFICIAL station "Lisice" of the Ministry of Environment (MOEPP), relayed by aqicn.org (WAQI)
+#      -> drawn DASHED  (-----)
+#   2) wherever the station has nothing (one pollutant, or the newest hours) the Open-Meteo CAMS
+#      model fills in -> drawn DOTTED and marked with *  (model data, NOT government-measured)
+#   so a line can look like  ----(official)----(official)....(model)
 WAQI_IDX = 8106
-WAQI_TOKEN_FILE = os.path.expanduser("~/.waqi_token")
+WAQI_TOKEN_DEFAULT = "5239ac77040e519133b5906004e8afad064cffba"     # your own token
+WAQI_TOKEN_FILE = os.path.expanduser("~/.waqi_token")                # (file or WAQI_TOKEN env override it)
 REF_PM_S = 600
+# model values are shown per clock hour (12:00-12:59) until the station publishes that hour, then replaced
+REF_STALE_S = 3 * 3600 # a reference value older than this is shown as N/A
 OM_AQ_URL = ("https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%s&longitude=%s"
              "&current=pm10,pm2_5&hourly=pm10,pm2_5"
              "&past_hours=6&forecast_hours=1&timezone=GMT&timeformat=unixtime" % (LAT, LON))
@@ -63,8 +72,10 @@ ref = {"pts": [], "t": None, "h": None, "ts": None, "dt": None}
 last_save = [0.0]
 
 live_pm = {"p25": None, "p10": None, "ts": None}
-hist_pm = []           # [ts, pm2.5, pm10]
-ref_pm = {"pts": [], "p25": None, "p10": None, "ts": None, "dt": None, "src": None, "note": ""}
+hist_pm = []           # [ts, pm2.5, pm10]  (your SDS011)
+off_pm = []            # [ts, pm2.5, pm10]  official station points, either value may be None
+mod_pm = []            # [ts, pm2.5, pm10]  model points, either value may be None
+ref_pm = {"ts": None, "note": ""}
 sds_state = {"msg": "starting..."}
 last_save_pm = [0.0]
 
@@ -80,8 +91,7 @@ def load():
         with open(FILE_PM) as f:
             d = json.load(f)
         hist_pm.extend(p for p in d.get("pm", []) if now - p[0] <= WINDOW_S)
-        ref_pm["pts"] = [p for p in d.get("ref", []) if now - p[0] <= WINDOW_S + 3600]
-        ref_pm["src"] = d.get("src")
+        off_pm.extend(p for p in d.get("off", []) if now - p[0] <= WINDOW_S + 3600)
     except Exception:
         pass
 
@@ -94,7 +104,7 @@ def save():
 def save_pm():
     tmp = FILE_PM + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"pm": hist_pm, "ref": ref_pm["pts"], "src": ref_pm["src"]}, f)
+        json.dump({"pm": hist_pm, "off": off_pm}, f)
     os.replace(tmp, FILE_PM)
 
 def maybe_save_pm(now):          # call with the lock held
@@ -126,6 +136,19 @@ def add_pm(p25, p10):
         hist_pm[:] = [p for p in hist_pm if now - p[0] <= WINDOW_S]
         maybe_save_pm(now)
 
+def set_live(t, h):
+    with lock:
+        live["t"], live["h"] = t, h
+
+def set_live_pm(p25, p10):
+    with lock:
+        live_pm["p25"], live_pm["p10"], live_pm["ts"] = p25, p10, time.time()
+
+def mean2(vals):
+    """[(a, b), ...] -> (sum of a / count, sum of b / count), rounded to 0.1"""
+    n = len(vals)
+    return round(sum(v[0] for v in vals) / n, 1), round(sum(v[1] for v in vals) / n, 1)
+
 def read_once(dht):
     for _ in range(6):
         try:
@@ -141,21 +164,29 @@ def reader():
     dht = None
     while True:
         t0 = time.time()
-        ok = False
+        vals = []
         try:
-            if dht is None:
-                dht = adafruit_dht.DHT11(board.D4)
-            r = read_once(dht)
-            if r:
-                add(*r)
-                ok = True
+            for i in range(DHT_N):                  # DHT_N readings spread evenly over READ_S
+                wait = t0 + i * READ_S / DHT_N - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                if dht is None:
+                    dht = adafruit_dht.DHT11(board.D4)
+                r = read_once(dht)
+                if r:
+                    vals.append(r)
+                    set_live(*mean2(vals))          # number on the page right after the first reading
         except Exception:
             try:
                 dht.exit()
             except Exception:
                 pass
             dht = None
-        time.sleep(max(1, READ_S - (time.time() - t0)) if ok else 30)   # failed read: retry in 30 s
+        if vals:
+            add(*mean2(vals))                       # logged point = sum of the readings / their count
+            time.sleep(max(1, READ_S - (time.time() - t0)))
+        else:
+            time.sleep(30)                          # nothing read: retry in 30 s
 
 # ---------------- SDS011 reader (plug and play) ----------------
 def sds_cmd(d1, d2=0, d3=0):
@@ -176,12 +207,12 @@ def sds_frame(s):
             return (f[2] | f[3] << 8) / 10, (f[4] | f[5] << 8) / 10
     return None
 
-def sds_measure(s):
+def sds_measure(s, warm=PM_WARM_S):
     """wake the sensor, let it warm up, average a few frames, put it back to sleep (saves the laser)"""
     s.write(sds_cmd(0x06, 1, 1))              # work mode: fan + laser on
     time.sleep(1)
     s.write(sds_cmd(0x02, 1, 0))              # active reporting (1 frame/s), in case it was in query mode
-    time.sleep(PM_WARM_S)
+    time.sleep(warm)
     s.reset_input_buffer()
     vals = []
     end = time.time() + PM_SAMPLE_S
@@ -198,6 +229,28 @@ def sds_measure(s):
     return (round(sum(v[0] for v in vals) / len(vals), 1),
             round(sum(v[1] for v in vals) / len(vals), 1))
 
+def pm_cycle(s, fresh):
+    """PM_N measurements spread evenly over PM_LOG_S, each one warmed up and averaged by sds_measure().
+    -> (pm2.5, pm10, count): sum of the valid measurements / their count (4 of 4 normally), or None"""
+    t0 = time.time()
+    vals, bad = [], 0
+    for i in range(PM_N):
+        wait = t0 + i * PM_LOG_S / PM_N - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        r = sds_measure(s, PM_WARM_S * 2 if fresh and i == 0 else PM_WARM_S)
+        if r:
+            vals.append(r)
+            set_live_pm(*mean2(vals))               # number on the page right after the first measurement
+            sds_state["msg"] = "SDS011 collecting %d/%d" % (len(vals), PM_N)
+        else:
+            bad += 1
+            if not vals and bad >= 2:               # nothing valid twice in a row: sensor gone, stop early
+                break
+    if len(vals) < PM_MIN_OK:
+        return None
+    return mean2(vals) + (len(vals),)
+
 def find_port():
     if SDS_PORT:
         return SDS_PORT if os.path.exists(SDS_PORT) else None
@@ -212,6 +265,7 @@ def pm_reader():
         sds_state["msg"] = "pyserial missing: sudo apt install python3-serial"
         return
     s = None
+    fresh = True                              # first reading after (re)connect: warm up twice as long
     while True:
         t0 = time.time()
         ok = False
@@ -223,14 +277,16 @@ def pm_reader():
                 else:
                     s = serial.Serial(port, 9600, timeout=2)
                     sds_state["msg"] = "SDS011 found on " + port
+                    fresh = True
             if s is not None:
-                r = sds_measure(s)
+                r = pm_cycle(s, fresh)
+                fresh = False
                 if r:
-                    add_pm(*r)
+                    add_pm(r[0], r[1])
                     ok = True
-                    sds_state["msg"] = "SDS011 ok"
+                    sds_state["msg"] = "SDS011 ok, avg of %d" % r[2]
                 else:
-                    sds_state["msg"] = "SDS011: port open but no valid data"
+                    sds_state["msg"] = "SDS011: port open but too few valid measurements"
         except Exception as e:
             sds_state["msg"] = "SDS011 error: %s" % e
         if not ok and s is not None:
@@ -239,7 +295,7 @@ def pm_reader():
             except Exception:
                 pass
             s = None
-        time.sleep(max(1, PM_S - (time.time() - t0)) if ok else 15)
+        time.sleep(max(1, PM_LOG_S - (time.time() - t0)) if ok else 15)
 
 # ---------------- reference weather ----------------
 def fetch_ref():
@@ -284,7 +340,8 @@ def waqi_token():
                 t = f.read()
         except Exception:
             t = None
-    return t.strip() if t and t.strip() else None
+    t = t.strip() if t and t.strip() else WAQI_TOKEN_DEFAULT
+    return t or None
 
 def fetch_pm_official(token):
     """MOEPP station Lisice via aqicn -> one point [ts, pm2.5, pm10] (either may be None)"""
@@ -326,51 +383,58 @@ def fetch_pm_model():
         raise RuntimeError("no model data")
     return pts
 
-def latest(pts, i):
-    for p in reversed(pts):
-        if p[i] is not None:
-            return p[i]
-    return None
-
 def ref_pm_loop():
     while True:
-        wait = 60
+        notes, point, pts = [], None, None
         token = waqi_token()
-        src, official, point, pts, note = None, False, None, None, ""
         if token:
             try:
                 point = fetch_pm_official(token)
-                src, official = "MOEPP station Lisice (official)", True
             except Exception as e:
-                note = "official feed failed (%s), showing model instead" % e
+                notes.append("official station failed: %s" % e)
         else:
-            note = "no token in ~/.waqi_token, showing model instead of the official station"
-        if src is None:
-            try:
-                pts = fetch_pm_model()
-                src = "Open-Meteo CAMS model"
-            except Exception as e:
-                note = (note + "; " if note else "") + "model failed: %s" % e
+            notes.append("no WAQI token, official station not used")
+        try:                                  # always fetched, it fills whatever the station does not give
+            pts = fetch_pm_model()
+        except Exception as e:
+            notes.append("model failed: %s" % e)
         now = time.time()
         with lock:
-            ref_pm["note"] = note
-            if src:
-                if src != ref_pm["src"]:                 # source changed: never mix the two
-                    ref_pm["pts"] = []
-                    ref_pm["src"] = src
-                if official:
-                    if not ref_pm["pts"] or ref_pm["pts"][-1][0] != point[0]:   # station updates hourly
-                        ref_pm["pts"].append(point)
+            ref_pm["note"] = "; ".join(notes)
+            if point:
+                b = point[0] // 3600          # clock hour of the station value
+                for i, old in enumerate(off_pm):
+                    if old[0] // 3600 == b:   # this hour is already stored: rewrite it
+                        off_pm[i] = [point[0], point[1] if point[1] is not None else old[1],
+                                     point[2] if point[2] is not None else old[2]]
+                        break
                 else:
-                    ref_pm["pts"] = pts
-                ref_pm["pts"] = [p for p in ref_pm["pts"] if now - p[0] <= WINDOW_S + 3600]
-                if ref_pm["pts"]:
-                    ref_pm["p25"], ref_pm["p10"] = latest(ref_pm["pts"], 1), latest(ref_pm["pts"], 2)
-                    ref_pm["dt"] = ref_pm["pts"][-1][0]
+                    off_pm.append(point)
+                    off_pm.sort(key=lambda p: p[0])
+            off_pm[:] = [p for p in off_pm if now - p[0] <= WINDOW_S + 3600]
+            if pts is not None:
+                mod_pm[:] = [p for p in pts if now - p[0] <= WINDOW_S + 3600]
+            if point or pts is not None:
                 ref_pm["ts"] = now
-                maybe_save_pm(now)
-                wait = REF_PM_S
-        time.sleep(wait)
+            maybe_save_pm(now)
+        ok = (point is not None or not token) and pts is not None
+        time.sleep(REF_PM_S if ok else 60)
+
+def merged(k):
+    """pollutant k (1 = PM2.5, 2 = PM10), handled on its own:
+    official station values first, the model only fills the hours the station does not cover
+    (that includes the newest hours, until the station publishes them).
+    -> [[ts, value, 'o' (official) | 'm' (model)], ...] sorted by time. Call with the lock held."""
+    off = [(p[0], p[k]) for p in off_pm if p[k] is not None]
+    mod = [(p[0], p[k]) for p in mod_pm if p[k] is not None]
+    out = [[t, v, "o"] for t, v in off]
+    have = {t // 3600 for t, _ in off}        # clock hours the station already published
+    for t, v in mod:
+        if t // 3600 in have:
+            continue                          # station value for this hour exists: it replaces the model
+        out.append([t, v, "m"])
+    out.sort(key=lambda p: p[0])
+    return out
 
 def cpu_temp():
     try:
@@ -405,19 +469,40 @@ def nice_top(v):
             return t
     return int(math.ceil(v * 1.1 / 100.0) * 100)
 
-def draw(now, W, Ht, axl, axr, layers, cid, unit=""):
-    """axl/axr = (lo, hi, label colour, label format) or None;
-    layers = (data, point index, 'L'/'R' axis, colour, dotted, max gap s, hold-to-now s)"""
+# line styles: sensor solid, official station dashed, model / weather reference dotted
+STY = {"solid": 'stroke-width="2.5" stroke-linejoin="round"',
+       "dash": 'stroke-width="3" stroke-dasharray="14 7"',
+       "dot": 'stroke-width="3.5" stroke-dasharray="0.1 9" stroke-linecap="round"'}
+
+KEYS = ("t", "h", "rt", "rh", "p25", "p10", "rp25", "rp10")    # ids of the 8 lines (click a value to hide it)
+INFO_DHT = "Pi sensor DHT11, average of %d readings" % DHT_N
+INFO_WX = "Open-Meteo weather model* (estimate, not measured)"
+INFO_SDS = "Pi sensor SDS011, average of %d measurements" % PM_N
+INFO_OFF = "MOEPP station Lisice (official, measured)"
+INFO_MOD = "Open-Meteo CAMS model* (estimate, not measured)"
+LAYER_KEYS = ("id", "data", "idx", "axis", "col", "mode", "gap", "hold", "name", "fmt", "info")
+LABEL_S = {3600: 600, 7200: 900, 14400: 1800}      # seconds between time labels for the 1 / 2 / 4 h windows
+HIDDEN_MSG = '<p style="opacity:.6">All lines are hidden - click a coloured value above to show one.</p>'
+
+def draw(now, win, W, Ht, axl, axr, layers, cid, unit=""):
+    """axl/axr = (lo, hi, label colour, label format) or None; win = seconds shown;
+    layers = list of dicts (see LAYER_KEYS): data points, index of the value in a point, 'L'/'R' axis,
+    colour, mode, max gap s, hold-to-now s, name / format / info for the hover tooltip.
+    mode: 'solid' (sensor), 'dot' (weather model), or 'mix' = points are [ts, value, 'o'|'m'], a piece of
+    line is dashed when BOTH its ends are official station values, otherwise dotted (model involved).
+    Every point is also drawn as a small dot (filled = measured, hollow = model) that the page script
+    can hover / tap."""
     L, R, T, B = 56, 56, 14, 34
     pw, ph = W - L - R, Ht - T - B
-    x0 = now - WINDOW_S
-    X = lambda ts: L + (ts - x0) / WINDOW_S * pw
+    x0 = now - win
+    X = lambda ts: L + (ts - x0) / win * pw
     Y = {}
     for k, ax in (("L", axl), ("R", axr)):
         if ax:
             Y[k] = (lambda lo, hi: lambda v: T + (hi - v) / (hi - lo) * ph)(ax[0], ax[1])
+    lab = LABEL_S.get(win, 1800)
 
-    s = [f'<svg viewBox="0 0 {W} {Ht}" style="width:100%;height:auto;display:block" font-size="14">',
+    s = [f'<svg class="chart" viewBox="0 0 {W} {Ht}" style="width:100%;height:auto;display:block;touch-action:pan-y" font-size="14">',
          f'<defs><clipPath id="{cid}"><rect x="{L}" y="{T}" width="{pw}" height="{ph}"/></clipPath></defs>']
     for i in range(6):
         f = i / 5
@@ -428,102 +513,307 @@ def draw(now, W, Ht, axl, axr, layers, cid, unit=""):
                 lo, hi, col, fmt = ax
                 s.append(f'<text x="{x}" y="{y+5:.1f}" text-anchor="{anchor}" fill="{col}">{fmt % (hi-(hi-lo)*f)}</text>')
     if unit:
-        s.append(f'<text x="{W-R+6}" y="{T+5}" fill="currentColor" opacity=".7">{unit}</text>')
+        s.append(f'<text x="{W-2}" y="{T+5}" text-anchor="end" fill="currentColor" opacity=".7">{unit}</text>')
     first = math.ceil(x0 / GRID_S) * GRID_S
     for ts in range(int(first), int(now) + 1, GRID_S):
         x = X(ts)
         hour = ts % 3600 == 0
         s.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{T}" y2="{T+ph}" stroke="currentColor" opacity="{.35 if hour else .12}"/>')
-        if ts % 1800 == 0:
+        if ts % lab == 0:
             s.append(f'<text x="{x:.1f}" y="{Ht-10}" text-anchor="middle" fill="currentColor">{datetime.fromtimestamp(ts):%H:%M}</text>')
 
     s.append(f'<g clip-path="url(#{cid})">')
-    # reference first (dotted, underneath), then the sensor on top (solid); each is held flat to now
-    for data, idx, axis, col, dotted, gap, hold in layers:
-        data = [p for p in data if p[idx] is not None]
+    # reference first (underneath), then the sensor on top (solid); each is held flat to now
+    for ly in layers:
+        idx, col, mode = ly["idx"], ly["col"], ly["mode"]
+        data = [p for p in ly["data"] if p[idx] is not None]
         if not data:
             continue
-        Yv = Y[axis]
-        style = ('stroke-width="3.5" stroke-dasharray="0.1 9" stroke-linecap="round"'
-                 if dotted else 'stroke-width="2.5" stroke-linejoin="round"')
-        for sg in segments(data, gap):
-            c = " ".join(f"{X(p[0]):.1f},{Yv(p[idx]):.1f}" for p in sg)
-            s.append(f'<polyline points="{c}" fill="none" stroke="{col}" {style}/>')
+        Yv = Y[ly["axis"]]
+
+        def pl(pp, st, extra=""):
+            c = " ".join(f"{X(p[0]):.1f},{Yv(p[idx]):.1f}" for p in pp)
+            return f'<polyline points="{c}" fill="none" stroke="{col}" {STY[st]}{extra}/>'
+
+        for sg in segments(data, ly["gap"]):
+            if mode == "mix":
+                runs = []
+                for a, b in zip(sg, sg[1:]):
+                    st = "dash" if a[2] == "o" and b[2] == "o" else "dot"
+                    if runs and runs[-1][0] == st:
+                        runs[-1][1].append(b)
+                    else:
+                        runs.append([st, [a, b]])
+                for st, pp in runs:
+                    s.append(pl(pp, st))
+            else:
+                s.append(pl(sg, mode))
         p = data[-1]
-        if 0 < now - p[0] <= hold:      # zero-order hold: keep the last value flat up to "now"
-            s.append(f'<polyline points="{X(p[0]):.1f},{Yv(p[idx]):.1f} {X(now):.1f},{Yv(p[idx]):.1f}" '
-                     f'fill="none" stroke="{col}" stroke-opacity=".55" {style}/>')
-        if dotted:
-            s.append(f'<circle cx="{X(p[0]):.1f}" cy="{Yv(p[idx]):.1f}" r="5" fill="none" stroke="{col}" stroke-width="2.5"/>')
-        else:
-            s.append(f'<circle cx="{X(p[0]):.1f}" cy="{Yv(p[idx]):.1f}" r="4.5" fill="{col}"/>')
-    s.append("</g></svg>")
+        if 0 < now - p[0] <= ly["hold"]:      # zero-order hold: keep the last value flat up to "now"
+            st = ("dash" if p[2] == "o" else "dot") if mode == "mix" else mode
+            s.append(pl([p, [now, p[idx], p[idx]]], st, ' stroke-opacity=".55"'))
+        for p in data:                         # one hoverable dot per measurement
+            if p[0] < x0 or p[0] > now + 60:
+                continue
+            if mode == "mix":
+                measured = p[2] == "o"
+                info = INFO_OFF if measured else INFO_MOD
+            else:
+                measured = mode == "solid"
+                info = ly["info"]
+            rad = 5.5 if p is data[-1] else 3.5
+            fill = col if measured else "none"
+            a_n = escape(ly["name"] + ("" if measured else "*"), True)
+            a_v = escape(ly["fmt"] % p[idx], True)
+            a_x = escape(datetime.fromtimestamp(p[0]).strftime("%H:%M"), True)
+            a_i = escape(info, True)
+            s.append(f'<circle class="pt" cx="{X(p[0]):.1f}" cy="{Yv(p[idx]):.1f}" r="{rad}" fill="{fill}" '
+                     f'stroke="{col}" stroke-width="2" data-n="{a_n}" data-v="{a_v}" data-x="{a_x}" '
+                     f'data-i="{a_i}" data-c="{col}"/>')
+    s.append("</g>")
+    # hover helpers, moved around by the page script
+    s.append(f'<line class="gl" x1="0" x2="0" y1="{T}" y2="{T+ph}" stroke="currentColor" stroke-opacity=".45" '
+             f'stroke-dasharray="4 4" visibility="hidden" pointer-events="none"/>')
+    s.append('<circle class="hl" cx="0" cy="0" r="9" fill="none" stroke-width="3" visibility="hidden" pointer-events="none"/>')
+    s.append("</svg>")
     return "".join(s)
 
-def chart(pts, rpts, now):
-    x0 = now - WINDOW_S
+def chart(pts, rpts, now, win, hide):
+    x0 = now - win
     pts = [p for p in pts if p[0] >= x0]
     rpts = [p for p in rpts if p[0] >= x0 - 3600]   # one point before the window for continuity
-    allp = pts + rpts
-    if not allp:
+    if not (pts or rpts):
         return '<p style="opacity:.6">Collecting data...</p>'
-    tl, th = scale([p[1] for p in allp])
-    hl, hh = scale([p[2] for p in allp], (0, 100))
-    layers = ((rpts, 1, "L", C_RT, True, 7200, REF_S * 3), (rpts, 2, "R", C_RH, True, 7200, REF_S * 3),
-              (pts, 1, "L", C_T, False, READ_S * 3, READ_S * 3), (pts, 2, "R", C_H, False, READ_S * 3, READ_S * 3))
-    return draw(now, 1200, 600, (tl, th, C_T, "%.0f°"), (hl, hh, C_H, "%.0f%%"), layers, "cp")
+    spec = (("rt", rpts, 1, "L", C_RT, "dot", 7200, REF_S * 3, "ref Temperatura", "%.1f °C", INFO_WX),
+            ("rh", rpts, 2, "R", C_RH, "dot", 7200, REF_S * 3, "ref Vlaznost", "%.0f %%", INFO_WX),
+            ("t", pts, 1, "L", C_T, "solid", READ_S * 3, READ_S * 3, "Temperatura", "%.1f °C", INFO_DHT),
+            ("h", pts, 2, "R", C_H, "solid", READ_S * 3, READ_S * 3, "Vlaznost", "%.1f %%", INFO_DHT))
+    layers = [dict(zip(LAYER_KEYS, sp)) for sp in spec if sp[0] not in hide]
+    vl = [p[ly["idx"]] for ly in layers if ly["axis"] == "L" for p in ly["data"] if p[ly["idx"]] is not None]
+    vr = [p[ly["idx"]] for ly in layers if ly["axis"] == "R" for p in ly["data"] if p[ly["idx"]] is not None]
+    if not (vl or vr):
+        return HIDDEN_MSG
+    axl = (*scale(vl), C_T, "%.0f°") if vl else None
+    axr = (*scale(vr, (0, 100)), C_H, "%.0f%%") if vr else None
+    return draw(now, win, 1200, 600, axl, axr, layers, "cp")
 
-def chart_pm(pts, rpts, now):
-    x0 = now - WINDOW_S
+def chart_pm(pts, r25, r10, now, win, hide):
+    x0 = now - win
     pts = [p for p in pts if p[0] >= x0]
-    rpts = [p for p in rpts if p[0] >= x0 - 3600]
-    vals = [v for p in pts + rpts for v in (p[1], p[2]) if v is not None]
-    if not vals:
+    r25 = [p for p in r25 if p[0] >= x0 - 3600]
+    r10 = [p for p in r10 if p[0] >= x0 - 3600]
+    if not (pts or r25 or r10):
         return '<p style="opacity:.6">Collecting PM data...</p>'
-    top = nice_top(max(vals))
-    # one shared ug/m3 axis (0..top); PM10 drawn first so PM2.5 stays visible on top
-    layers = ((rpts, 2, "L", C_RP10, True, 10800, 7200), (rpts, 1, "L", C_RP25, True, 10800, 7200),
-              (pts, 2, "L", C_P10, False, PM_S * 3, PM_S * 3), (pts, 1, "L", C_P25, False, PM_S * 3, PM_S * 3))
-    return draw(now, 1200, 450, (0, top, "currentColor", "%.0f"), None, layers, "cp2", "µg/m³")
+    # PM10 drawn first so PM2.5 stays visible on top
+    spec = (("rp10", r10, 1, "L", C_RP10, "mix", 10800, 7200, "ref PM10", "%.1f µg/m³", ""),
+            ("rp25", r25, 1, "L", C_RP25, "mix", 10800, 7200, "ref PM2.5", "%.1f µg/m³", ""),
+            ("p10", pts, 2, "L", C_P10, "solid", PM_LOG_S * 3, PM_LOG_S * 3, "PM10", "%.1f µg/m³", INFO_SDS),
+            ("p25", pts, 1, "L", C_P25, "solid", PM_LOG_S * 3, PM_LOG_S * 3, "PM2.5", "%.1f µg/m³", INFO_SDS))
+    layers = [dict(zip(LAYER_KEYS, sp)) for sp in spec if sp[0] not in hide]
+    vals = [p[ly["idx"]] for ly in layers for p in ly["data"] if p[ly["idx"]] is not None]
+    if not vals:
+        return HIDDEN_MSG
+    # one shared ug/m3 axis (0..top)
+    return draw(now, win, 1200, 450, (0, nice_top(max(vals)), "currentColor", "%.0f"), None, layers, "cp2", "µg/m³")
+
+def stat_txt(pts, idx, now, win, name, unit):
+    """min / average / max of one local sensor series inside the window"""
+    v = [p[idx] for p in pts if p[0] >= now - win and p[idx] is not None]
+    if not v:
+        return ""
+    return "%s: min %.1f · avg %.1f · max %.1f %s (%d points)" % (name, min(v), sum(v) / len(v), max(v), unit, len(v))
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta http-equiv="refresh" content="30"><title>Pi</title></head>
-<body style="font-family:sans-serif;text-align:center;margin:8px 1vw">
+<noscript><meta http-equiv="refresh" content="30"></noscript><title>Pi</title>
+<style>
+body{font-family:sans-serif;text-align:center;margin:8px 1vw}
+.tg{cursor:pointer;user-select:none;-webkit-user-select:none}
+.tg.off{opacity:.4;text-decoration:line-through}
+.ctl{font-size:.85rem;margin-bottom:8px;display:flex;justify-content:center;gap:.4rem;flex-wrap:wrap;align-items:center}
+.ctl button{font:inherit;padding:2px 10px;border:1px solid currentColor;border-radius:12px;background:none;color:inherit;opacity:.55;cursor:pointer}
+.ctl button.on{opacity:1;font-weight:bold}
+.hint{opacity:.6}
+svg.chart{touch-action:pan-y;-webkit-user-select:none;user-select:none}
+#tip{display:none;position:fixed;z-index:10;pointer-events:none;max-width:320px;text-align:left;font-size:.85rem;padding:6px 9px;border-radius:6px;border:1px solid #8888;background:#fff;color:#111;box-shadow:0 2px 8px #0004}
+#tip .ti + .ti{margin-top:6px;padding-top:6px;border-top:1px solid #8886}
+@media (prefers-color-scheme: dark){#tip{background:#262626;color:#eee}}
+@media (max-width:700px){svg.chart text{font-size:24px}}
+</style></head>
+<body>
+<div id="main">
+<div class="ctl"><span>Window:</span>
+<button data-w="1" class="@B1@">1 h</button><button data-w="2" class="@B2@">2 h</button><button data-w="4" class="@B4@">4 h</button>
+<span class="hint">click a coloured value to hide / show its line &nbsp;·&nbsp; hover or tap any dot for details &nbsp;·&nbsp; ● measured &nbsp; ○ model*</span></div>
 <div style="font-size:1.1rem;display:flex;justify-content:center;gap:.4rem 1.2rem;flex-wrap:wrap;margin-bottom:4px">
 <b id="c">--:--:--</b><span>CPU: @CPU@</span>
-<span style="color:#e53935">Temperatura: @T@</span>
-<span style="color:#1e88e5">Vlaznost: @H@</span>
-<span style="color:#fb8c00">ref Temperatura: @RT@</span>
-<span style="color:#00bcd4">ref Vlaznost: @RH@</span></div>
-<div style="font-size:.85rem;opacity:.8;margin-bottom:6px">solid = Pi sensor (DHT11) &nbsp;|&nbsp; dotted = ref, source: <a href="https://open-meteo.com/" style="color:inherit"><b>Open-Meteo.com</b></a> (api.open-meteo.com), Aerodrom, Skopje (@LL@), value time @REFDT@, checked @REFTIME@, polled every @REFEVERY@ min</div>
+<span class="tg@G_t@" data-k="t" style="color:#e53935">Temperatura: @T@</span>
+<span class="tg@G_h@" data-k="h" style="color:#1e88e5">Vlaznost: @H@</span>
+<span class="tg@G_rt@" data-k="rt" style="color:#fb8c00">ref Temperatura: @RT@*</span>
+<span class="tg@G_rh@" data-k="rh" style="color:#00bcd4">ref Vlaznost: @RH@*</span></div>
+<div style="font-size:.85rem;opacity:.8;margin-bottom:6px">solid = Pi sensor (DHT11, avg of @DHTN@ readings per @READMIN@ min) &nbsp;|&nbsp; dotted = ref, source: <a href="https://open-meteo.com/" style="color:inherit"><b>Open-Meteo.com*</b></a> (api.open-meteo.com), Aerodrom, Skopje (@LL@), value time @REFDT@, checked @REFTIME@, polled every @REFEVERY@ min</div>
 @CHART@
-<div style="font-size:.75rem;opacity:.6;margin-top:6px">ref data: Open-Meteo.com (CC BY 4.0), best-match national weather service models (DWD, ECMWF, NOAA...) interpolated to the grid point. Model values, not a ground station.</div>
+<div style="font-size:.8rem;opacity:.8;margin-top:4px">@STATS1@</div>
+<div style="font-size:.75rem;opacity:.6;margin-top:6px">* ref data: Open-Meteo.com (CC BY 4.0), best-match national weather service models (DWD, ECMWF, NOAA...) interpolated to the grid point. Model values, not government-measured data and not a ground station.</div>
 
 <div style="font-size:1.1rem;display:flex;justify-content:center;gap:.4rem 1.2rem;flex-wrap:wrap;margin:22px 0 4px">
-<span style="color:#9c27b0">PM2.5: @P25@</span>
-<span style="color:#43a047">PM10: @P10@</span>
-<span style="color:#ec407a">ref PM2.5: @RP25@</span>
-<span style="color:#afb42b">ref PM10: @RP10@</span></div>
-<div style="font-size:.85rem;opacity:.8;margin-bottom:6px">solid = Pi sensor (SDS011, @SDSMSG@) &nbsp;|&nbsp; dotted = ref, source: <b>@PMSRC@</b>, Lisice, Skopje, value time @RPDT@, checked @RPTIME@, polled every @RPEVERY@ min</div>
+<span class="tg@G_p25@" data-k="p25" style="color:#9c27b0">PM2.5: @P25@</span>
+<span class="tg@G_p10@" data-k="p10" style="color:#43a047">PM10: @P10@</span>
+<span class="tg@G_rp25@" data-k="rp25" style="color:#ec407a">ref PM2.5: @RP25@</span>
+<span class="tg@G_rp10@" data-k="rp10" style="color:#afb42b">ref PM10: @RP10@</span></div>
+<div style="font-size:.85rem;opacity:.8;margin-bottom:6px">solid = Pi sensor (@SDSMSG@) &nbsp;|&nbsp; dashed = official station MOEPP Lisice, last station value @RPDT@ &nbsp;|&nbsp; dotted* = model, fills in where the station has nothing &nbsp;|&nbsp; checked @RPTIME@, polled every @RPEVERY@ min</div>
 @CHART2@
+<div style="font-size:.8rem;opacity:.8;margin-top:4px">@STATS2@</div>
 <div style="font-size:.75rem;opacity:.6;margin-top:6px">@PMNOTE@</div>
+</div>
+<div id="tip"></div>
 <script>
 var off=@OFF@-Date.now();
-function tick(){document.getElementById('c').textContent=new Date(Date.now()+off).toISOString().substr(11,8)}
+function tick(){var e=document.getElementById('c');if(e)e.textContent=new Date(Date.now()+off).toISOString().substr(11,8)}
 tick();setInterval(tick,1000);
+
+var Q=@QJSON@,KEY='pi_graph_state_v1',busy=false,again=false,last=0,cur=null,hideT=null;
+var main=document.getElementById('main'),tip=document.getElementById('tip'),cache=new WeakMap();
+
+function saveQ(){try{localStorage.setItem(KEY,JSON.stringify(Q))}catch(e){}}
+function url(){return '?w='+Q.w+'&hide='+encodeURIComponent(Q.hide.join(','))}
+
+// reload the graphs in place (keeps the chosen window / hidden lines, no page flash)
+function refresh(force){
+  if(busy){if(force)again=true;return}
+  if(!force&&(document.hidden||cur||Date.now()-last<8000))return;   // do not disturb someone who is looking at a dot
+  busy=true;
+  fetch(url(),{cache:'no-store'})
+    .then(function(r){return r.text()})
+    .then(function(t){
+      var n=new DOMParser().parseFromString(t,'text/html').getElementById('main');
+      if(n){hideTip();main.innerHTML=n.innerHTML;tick()}
+    })
+    .catch(function(){})
+    .then(function(){busy=false;if(again){again=false;refresh(true)}});
+}
+setInterval(function(){refresh(false)},30000);
+
+// closest dot to the pointer, in screen pixels (sx, sy = screen pixels per svg unit)
+function nearest(pts,mx,my,sx,sy,lim){
+  var best=null,bd=lim*lim,i,dx,dy,d;
+  for(i=0;i<pts.length;i++){dx=pts[i].x*sx-mx;dy=pts[i].y*sy-my;d=dx*dx+dy*dy;if(d<=bd){bd=d;best=pts[i]}}
+  return best;
+}
+// all dots that sit on top of each other with the chosen one
+function cluster(pts,b,sx,sy,lim){
+  return pts.filter(function(p){var dx=(p.x-b.x)*sx,dy=(p.y-b.y)*sy;return dx*dx+dy*dy<=lim*lim});
+}
+
+function hideTip(){
+  clearTimeout(hideT);cur=null;tip.style.display='none';
+  [].forEach.call(document.querySelectorAll('svg.chart .hl, svg.chart .gl'),function(e){e.setAttribute('visibility','hidden')});
+}
+
+function showTip(items,cx,cy){
+  tip.textContent='';
+  items.forEach(function(it){
+    var d=document.createElement('div'),h=document.createElement('b'),t=document.createElement('div');
+    d.className='ti';
+    h.textContent=it.getAttribute('data-n')+'  '+it.getAttribute('data-v');
+    h.style.color=it.getAttribute('data-c');
+    t.textContent=it.getAttribute('data-x')+' · '+it.getAttribute('data-i');
+    d.appendChild(h);d.appendChild(t);tip.appendChild(d);
+  });
+  tip.style.display='block';
+  var w=tip.offsetWidth,h2=tip.offsetHeight,vw=document.documentElement.clientWidth;
+  var l=cx+16,t2=cy-h2-14;
+  if(l+w>vw-4)l=cx-w-16;
+  if(l<4)l=4;
+  if(t2<4)t2=cy+18;
+  tip.style.left=l+'px';tip.style.top=t2+'px';
+}
+
+function onMove(e){
+  var t=e.target,svg=(t&&t.closest)?t.closest('svg.chart'):null;
+  if(!svg){if(e.pointerType==='mouse')hideTip();return}
+  last=Date.now();
+  var r=svg.getBoundingClientRect(),vb=svg.viewBox.baseVal,sx=r.width/vb.width,sy=r.height/vb.height;
+  var pts=cache.get(svg);
+  if(!pts){
+    pts=[].map.call(svg.querySelectorAll('.pt'),function(el){return{el:el,x:+el.getAttribute('cx'),y:+el.getAttribute('cy')}});
+    cache.set(svg,pts);
+  }
+  var b=nearest(pts,e.clientX-r.left,e.clientY-r.top,sx,sy,26);
+  if(!b){hideTip();return}
+  if(cur&&cur!==svg)hideTip();
+  cur=svg;
+  var hl=svg.querySelector('.hl'),gl=svg.querySelector('.gl');
+  hl.setAttribute('cx',b.x);hl.setAttribute('cy',b.y);hl.setAttribute('stroke',b.el.getAttribute('data-c'));hl.setAttribute('visibility','visible');
+  gl.setAttribute('x1',b.x);gl.setAttribute('x2',b.x);gl.setAttribute('visibility','visible');
+  showTip(cluster(pts,b,sx,sy,7).map(function(p){return p.el}),e.clientX,e.clientY);
+  clearTimeout(hideT);
+  if(e.pointerType!=='mouse')hideT=setTimeout(hideTip,6000);     // touch: no "leave" event, so close it by timer
+}
+main.addEventListener('pointermove',onMove);
+main.addEventListener('pointerdown',onMove);
+main.addEventListener('pointerleave',function(e){if(e.pointerType==='mouse')hideTip()});
+document.addEventListener('pointerdown',function(e){var t=e.target;if(!(t&&t.closest&&t.closest('svg.chart')))hideTip()});
+
+// window buttons and click-to-hide on the coloured values
+document.addEventListener('click',function(e){
+  var t=e.target,el=(t&&t.closest)?t.closest('[data-w],[data-k]'):null;
+  if(!el)return;
+  if(el.hasAttribute('data-w')){Q.w=parseInt(el.getAttribute('data-w'),10)}
+  else{var k=el.getAttribute('data-k'),i=Q.hide.indexOf(k);if(i>=0)Q.hide.splice(i,1);else Q.hide.push(k);Q.hide.sort()}
+  saveQ();refresh(true);
+});
+
+// remember the choice: an explicit ?w=..&hide=.. in the address wins, otherwise the saved one
+(function(){
+  var sp=new URLSearchParams(location.search),want=null;
+  if(sp.has('w')||sp.has('hide')){saveQ();return}
+  try{want=JSON.parse(localStorage.getItem(KEY)||'null')}catch(e){}
+  if(want&&[1,2,4].indexOf(want.w)>=0&&Array.isArray(want.hide)){
+    want.hide=want.hide.filter(function(k){return typeof k==='string'}).sort();
+    if(want.w!==Q.w||want.hide.join(',')!==Q.hide.join(',')){Q=want;refresh(true)}
+  }
+})();
 </script></body></html>"""
 
-PM_NOTE_OFFICIAL = ("ref PM: Ministry of Environment and Physical Planning of North Macedonia (air.moepp.gov.mk), "
+PM_NOTE_OFFICIAL = ("MOEPP = Ministry of Environment and Physical Planning of North Macedonia (air.moepp.gov.mk), "
                     "automatic station Lisice, relayed by the World Air Quality Index project (aqicn.org). "
                     "The feed gives US-EPA AQI, converted here back to µg/m³. Unvalidated near-real-time data, "
-                    "updated hourly, the line builds up while this script runs. ")
-PM_NOTE_MODEL = ("ref PM: Open-Meteo.com (CC BY 4.0), CAMS European air-quality model (Copernicus) at the grid point. "
-                 "Model values, not a ground station. ")
+                    "updated hourly, the official line builds up while this script runs. ")
+PM_NOTE_MODEL = ("* Open-Meteo.com (CC BY 4.0), CAMS European air-quality model (Copernicus) at the grid point: "
+                 "model values, not government-measured data. It only fills what the station does not give, "
+                 "PM2.5 and PM10 are decided separately. ")
+
+def fmt_ref(m, now):
+    """latest merged point -> '12.3 µg/m³'; a model value gets * and the last station value next to it"""
+    if m and now - m[-1][0] <= REF_STALE_S:
+        t, v, src = m[-1]
+        txt = "%.1f µg/m³" % v
+        if src == "m":
+            txt += "*"
+            offs = [p for p in m if p[2] == "o"]
+            if offs:
+                txt += " (station %.1f at %s)" % (offs[-1][1], datetime.fromtimestamp(offs[-1][0]).strftime("%H:%M"))
+        return txt
+    return "N/A"
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        q = parse_qs(u.query)                 # ?w=1|2|4 (hours shown)  &hide=t,h,p25,... (lines switched off)
+        try:
+            w = int(q.get("w", ["4"])[0])
+        except ValueError:
+            w = 4
+        if w not in (1, 2, 4):
+            w = 4
+        hide = {k for k in ",".join(q.get("hide", [])).split(",") if k in KEYS}
+        win = w * 3600
         now = time.time()
         with lock:
             pts = list(hist)
@@ -531,46 +821,65 @@ class H(BaseHTTPRequestHandler):
             t, h = live["t"], live["h"]
             rt, rh, rts, rdt = ref["t"], ref["h"], ref["ts"], ref["dt"]
             ppts = list(hist_pm)
-            rpp = list(ref_pm["pts"])
+            m25, m10 = merged(1), merged(2)
             pm25, pm10, pmts = live_pm["p25"], live_pm["p10"], live_pm["ts"]
-            r25, r10, rpts, rpdt = ref_pm["p25"], ref_pm["p10"], ref_pm["ts"], ref_pm["dt"]
-            rpsrc, rpnote = ref_pm["src"], ref_pm["note"]
+            rpts, rpnote = ref_pm["ts"], ref_pm["note"]
             sdsmsg = sds_state["msg"]
         off = datetime.now().astimezone().utcoffset().total_seconds()
-        pm_ok = pmts is not None and now - pmts <= PM_S * 3 + 120      # unplugged sensor -> numbers disappear
-        official = rpsrc is not None and "official" in rpsrc
+        pm_ok = pmts is not None and now - pmts <= PM_LOG_S * 3 + 120      # unplugged sensor -> numbers disappear
+        x0 = now - win
+        used = {p[2] for m in (m25, m10) for p in m if p[0] >= x0}      # which sources are on the graph
+        offt = [p[0] for m in (m25, m10) for p in m if p[2] == "o"]     # times of the station values
+
+        def stats(parts):
+            txt = " &nbsp;|&nbsp; ".join(x for x in parts if x)
+            return ("Pi sensor, last %d h: %s" % (w, txt)) if txt else ""
+        st1 = stats((stat_txt(pts, 1, now, win, "Temperatura", "°C") if "t" not in hide else "",
+                     stat_txt(pts, 2, now, win, "Vlaznost", "%") if "h" not in hide else ""))
+        st2 = stats((stat_txt(ppts, 1, now, win, "PM2.5", "µg/m³") if "p25" not in hide else "",
+                     stat_txt(ppts, 2, now, win, "PM10", "µg/m³") if "p10" not in hide else ""))
+
         subs = {
             "@CPU@": cpu_temp(),
-            "@T@": f"{t} °C" if t is not None else "...",
-            "@H@": f"{h} %" if h is not None else "...",
+            "@T@": f"{t:.1f} °C" if t is not None else "...",
+            "@H@": f"{h:.1f} %" if h is not None else "...",
             "@RT@": f"{rt:.1f} °C" if rt is not None else "N/A",
             "@RH@": f"{rh:.0f} %" if rh is not None else "N/A",
             "@REFTIME@": f"{datetime.fromtimestamp(rts):%H:%M}" if rts else "never (no internet?)",
             "@REFDT@": f"{datetime.fromtimestamp(rdt):%H:%M}" if rdt else "N/A",
             "@REFEVERY@": str(REF_S // 60),
+            "@DHTN@": str(DHT_N),
+            "@READMIN@": str(READ_S // 60),
             "@LL@": f"{LAT}N {LON}E",
-            "@CHART@": chart(pts, rp, now),
+            "@CHART@": chart(pts, rp, now, win, hide),
+            "@STATS1@": st1,
             "@P25@": f"{pm25:.1f} µg/m³" if pm_ok and pm25 is not None else "no data",
             "@P10@": f"{pm10:.1f} µg/m³" if pm_ok and pm10 is not None else "no data",
-            "@RP25@": f"{r25:.1f} µg/m³" if r25 is not None else "N/A",
-            "@RP10@": f"{r10:.1f} µg/m³" if r10 is not None else "N/A",
+            "@RP25@": fmt_ref(m25, now),
+            "@RP10@": fmt_ref(m10, now),
             "@SDSMSG@": escape(sdsmsg),
-            "@PMSRC@": escape(rpsrc) if rpsrc else "N/A (no internet?)",
             "@RPTIME@": f"{datetime.fromtimestamp(rpts):%H:%M}" if rpts else "never",
-            "@RPDT@": f"{datetime.fromtimestamp(rpdt):%H:%M}" if rpdt else "N/A",
+            "@RPDT@": f"{datetime.fromtimestamp(max(offt)):%H:%M}" if offt else "none yet",
             "@RPEVERY@": str(REF_PM_S // 60),
-            "@CHART2@": chart_pm(ppts, rpp, now),
-            "@PMNOTE@": (PM_NOTE_OFFICIAL if official else PM_NOTE_MODEL if rpsrc else "")
+            "@CHART2@": chart_pm(ppts, m25, m10, now, win, hide),
+            "@STATS2@": st2,
+            "@PMNOTE@": (PM_NOTE_OFFICIAL if "o" in used else "")
+                        + (PM_NOTE_MODEL if "m" in used else "")
                         + (("<br>" + escape(rpnote)) if rpnote else ""),
             "@OFF@": str(int((now + off) * 1000)),
+            "@QJSON@": json.dumps({"w": w, "hide": sorted(hide)}),
+            "@B1@": "on" if w == 1 else "",
+            "@B2@": "on" if w == 2 else "",
+            "@B4@": "on" if w == 4 else "",
         }
-        html = PAGE
-        for k, v in subs.items():
-            html = html.replace(k, v)
+        for k in KEYS:
+            subs["@G_%s@" % k] = " off" if k in hide else ""
+        html = re.sub(r"@[A-Za-z0-9_]+@", lambda m: subs.get(m.group(0), m.group(0)), PAGE)   # one pass over the page
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
