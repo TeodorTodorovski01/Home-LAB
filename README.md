@@ -112,24 +112,31 @@ before launching.
 ### Automatic detection
 
 On startup and after each new SDS011 reading, the app scans the available
-four-hour sensor history. An event is recorded when it matches one of these
-local screening rules:
+five-day local PM history. It deliberately uses sensitive candidate rules to
+collect examples for you to review:
 
 1. **Transient spike:** a PM2.5 or PM10 reading rises by at least
-   **30 µg/m³** and reaches **2×** its baseline. For a large transient, the
-   detector can use the one to three preceding readings available.
-2. **Sustained relative rise:** at least **10 µg/m³** and **1.25×** baseline
-   in two of three readings, with all three baseline readings available.
+   **15 µg/m³** and reaches **1.5×** its baseline. It is logged as soon as
+   the elevated reading arrives; its five-before/five-after context is updated
+   as more readings arrive.
+2. **Sustained relative rise:** at least **5 µg/m³** and **1.15×** baseline
+   in two of three readings, with all five baseline readings available.
 3. **Sustained high-level crossing:** PM2.5 reaches **35.5 µg/m³** or PM10
    reaches **155 µg/m³** after a lower reading, and at least two of the next
    three readings remain at or above that level. This catches a gradual
    medium-to-high increase even without a large relative spike.
 
-These are short-term screening thresholds, not official AQI or health
-assessments. The SDS011 readings are local, short-cycle sensor values; they are
-not the averaged measurements used for formal regulatory reporting. The
-`INCIDENT_*` constants near the top of `mesure.py` are the settings to review
-if you want to tune the detector for your sensor and location.
+These are deliberately sensitive, short-term screening thresholds, not
+official AQI or health assessments. Expect extra false positives; label them
+or choose **NC**. The SDS011 readings are local, short-cycle sensor values,
+not the averaged measurements used for formal regulatory reporting. Baselines
+use the median of up to five preceding readings. When all five are available,
+the transient and relative-rise thresholds also account for normal variation
+using the median absolute deviation (MAD), reducing triggers when recent
+readings are unusually noisy. The absolute high-level crossing remains a
+separate fixed-threshold rule. Rise rules look for an upward crossing, not
+every reading in an already elevated plateau, to avoid logging one episode
+repeatedly.
 
 Every detected event is saved, including events the classifier cannot decide.
 Those rows show **Undetermined** until you label them. Detections within one
@@ -141,22 +148,23 @@ duplicates. Incident rows are stored in the database indefinitely.
 On the incident page:
 
 1. Use **Incident date and time** to select the Pi's local event time.
-2. Click **Save incident readings**. Manual entries require three PM readings
-   before and three after the selected time. With the current sampling period,
-   wait about 20 minutes after the event for the following readings.
+2. Click **Save incident readings**. Manual entries require five PM readings
+   before and after the selected time. With the current sampling period, allow
+   about 40–50 minutes for five readings after the event.
 3. In the table, choose **Clean**, **Cleaning**, **Smoking**, or **Fire** from
    the dropdown and save the label.
 4. Choose **NC — discard from training** for a false positive. This keeps the
    incident record but excludes it from classifier examples.
 
-Manual entries must be within the four-hour sensor history and have the
-required readings available. Automatic large-transient detections can use
-fewer pre-event readings than the manual form.
+Manual entries must be within the five-day sensor history and have the
+required readings available. Automatic transient candidates are stored
+immediately with the available pre-event readings; their sample context is
+expanded as later sensor readings arrive.
 
 ### How predictions work
 
 The classifier is a local **3-nearest-neighbours** model, not an LLM or neural
-network. It compares each event's baseline, normalized peak rise, peak
+network. It compares each event's median baseline, normalized peak rise, peak
 position, and final post-event reading for PM2.5 and PM10 with the examples
 you labeled. It starts predicting after it has at least four labeled
 incidents across at least two classes, and reports a class only when at least
@@ -174,6 +182,13 @@ labels, and how many predictions were abstentions. This small, local dataset
 check is not a safety validation. A prediction must never be used as a fire
 alarm or substitute for a certified detector.
 
+The current classifier labels detected candidate events; it does not scan
+ordinary readings to discover events by itself. Replacing the candidate
+detector later would require labeled **no-event** windows as well as examples
+of each event class, followed by validation on separate readings. The current
+**NC** option only excludes a candidate from training; it is not a no-event
+training class.
+
 ## Local files and retention
 
 All paths below are relative to the home directory of the user running the
@@ -183,13 +198,16 @@ app:
 | --- | --- | --- |
 | `~/clock.py` | Generated Python application | Until replaced |
 | `~/history1m.json` | DHT temperature/humidity history | Rolling four hours |
-| `~/history_pm.json` | SDS011 and pollution reference history | Rolling four hours |
+| `~/history_pm.json` | SDS011 and pollution reference history | Local PM readings: rolling five days; references: rolling four hours |
 | `~/incidents.sqlite3` | Incident readings, detection reason, and labels | Kept until you remove or back up the file |
 | `~/.waqi_token` | Optional private WAQI token | Kept until you remove the file |
 
-The four-hour sensor log limits what can be scanned after a restart. Incidents
-already saved in SQLite remain there; raw PM measurements outside the rolling
-history are not archived by this application.
+The five-day local PM log is scanned after a restart. Incidents already saved
+in SQLite remain there; raw PM measurements older than the rolling five-day
+history are not archived by this application. The dashboard still displays
+its selected one-to-four-hour graph window. The five-day window starts filling
+after this version is deployed; readings already removed by the old four-hour
+retention cannot be recovered.
 
 ## Troubleshooting
 
@@ -199,10 +217,9 @@ history are not archived by this application.
 - **No temperature/humidity:** check DHT11 wiring to BCM GPIO 4, the active
   virtual environment, and Blinka/DHT dependencies.
 - **Incident not detected:** review the event's timestamped before/after
-  readings, not only the chart's maximum. The detector needs enough context
-  and must meet a screening rule above. Duplicate events within one reading
-  interval are skipped. The scanner can only inspect measurements still in
-  the four-hour history.
+  readings, not only the chart's maximum. The detector must meet a screening
+  rule above. Duplicate events within one reading interval are skipped. The
+  scanner can only inspect measurements still in the five-day history.
 - **Event says Undetermined:** label examples in the dropdown. Predictions
   require at least four labeled examples across two classes and a two-of-three
   neighbor majority.

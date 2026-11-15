@@ -3,6 +3,7 @@ import glob, json, math, os, re, sqlite3, threading, time, urllib.request
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from statistics import median
 from urllib.parse import parse_qs, urlparse
 import board, adafruit_dht
 try:
@@ -13,6 +14,7 @@ except ImportError:
 READ_S = 600           # log one temperature/humidity point every 10 min (same as reference)
 DHT_N = 4              # each point = average of 4 readings taken 2.5 min apart (1 = no averaging)
 WINDOW_S = 4 * 3600    # graph window (4 hours)
+PM_HISTORY_S = 5 * 24 * 3600  # keep five days of local PM data for incident review
 GRID_S = 300           # grid every 5 min
 SAVE_S = 300           # save to disk every 5 min (saves the SD card)
 FILE = os.path.expanduser("~/history1m.json")
@@ -40,11 +42,11 @@ FILE_PM = os.path.expanduser("~/history_pm.json")
 INCIDENT_DB = os.path.expanduser("~/incidents.sqlite3")
 INCIDENT_LABELS = ("clean", "cleaning", "smoking", "fire")
 INCIDENT_DISCARDED = "nc"
-INCIDENT_CONTEXT_N = 3
-INCIDENT_MIN_RISE_UGM3 = 10.0
-INCIDENT_MIN_RISE_RATIO = 1.25
-INCIDENT_TRANSIENT_RISE_UGM3 = 30.0
-INCIDENT_TRANSIENT_RISE_RATIO = 2.0
+INCIDENT_CONTEXT_N = 5
+INCIDENT_MIN_RISE_UGM3 = 5.0
+INCIDENT_MIN_RISE_RATIO = 1.15
+INCIDENT_TRANSIENT_RISE_UGM3 = 15.0
+INCIDENT_TRANSIENT_RISE_RATIO = 1.5
 INCIDENT_PM25_HIGH_UGM3 = 35.5
 INCIDENT_PM10_HIGH_UGM3 = 155.0
 INCIDENT_VALIDATION_MIN_N = 8
@@ -101,7 +103,7 @@ def load():
     try:
         with open(FILE_PM) as f:
             d = json.load(f)
-        hist_pm.extend(p for p in d.get("pm", []) if now - p[0] <= WINDOW_S)
+        hist_pm.extend(p for p in d.get("pm", []) if now - p[0] <= PM_HISTORY_S)
         off_pm.extend(p for p in d.get("off", []) if now - p[0] <= WINDOW_S + 3600)
     except Exception:
         pass
@@ -144,7 +146,7 @@ def add_pm(p25, p10):
     with lock:
         live_pm["p25"], live_pm["p10"], live_pm["ts"] = p25, p10, now
         hist_pm.append([now, p25, p10])
-        hist_pm[:] = [p for p in hist_pm if now - p[0] <= WINDOW_S]
+        hist_pm[:] = [p for p in hist_pm if now - p[0] <= PM_HISTORY_S]
         maybe_save_pm(now)
     detect_logged_incidents()
 
@@ -169,8 +171,8 @@ def incident_samples(event_ts):
     before = [p for p in points if p[0] < event_ts][-INCIDENT_CONTEXT_N:]
     after = [p for p in points if p[0] >= event_ts][:INCIDENT_CONTEXT_N]
     if len(before) != INCIDENT_CONTEXT_N or len(after) != INCIDENT_CONTEXT_N:
-        raise ValueError("Need three local PM readings before and three after the incident time. "
-                         "The SDS011 logs about every 10 minutes; wait for three readings after the event.")
+        raise ValueError("Need %d local PM readings before and after the incident time "
+                         "within the five-day sensor history." % INCIDENT_CONTEXT_N)
     return before + after
 
 def get_incidents():
@@ -190,11 +192,21 @@ def incident_sample_parts(samples):
     context_n = len(samples) // 2
     return samples[:context_n], samples[context_n:]
 
+def incident_baseline(before, column):
+    return median(point[column] for point in before)
+
+def incident_noise_scale(before, column):
+    if len(before) < INCIDENT_CONTEXT_N:
+        return 0.0
+    baseline = incident_baseline(before, column)
+    deviations = [abs(point[column] - baseline) for point in before]
+    return 1.4826 * median(deviations)
+
 def incident_features(samples):
     features = []
     before, after = incident_sample_parts(samples)
     for column in (1, 2):
-        baseline = sum(point[column] for point in before) / len(before)
+        baseline = incident_baseline(before, column)
         features.append(math.log1p(max(0, baseline)))
         scale = max(baseline, 5.0)
         changes = [(point[column] - baseline) / scale for point in after]
@@ -206,7 +218,7 @@ def incident_metrics(samples):
     before, after = incident_sample_parts(samples)
     metrics = []
     for column, name in ((1, "PM2.5"), (2, "PM10")):
-        baseline = sum(point[column] for point in before) / len(before)
+        baseline = incident_baseline(before, column)
         peak = max(after, key=lambda point: point[column])
         rise = peak[column] - baseline
         peak_offset = max(0, round((peak[0] - after[0][0]) / 60))
@@ -216,27 +228,32 @@ def incident_metrics(samples):
 
 def incident_rise_detected(samples):
     before, after = incident_sample_parts(samples)
-    baseline = [sum(point[column] for point in before) / len(before) for column in (1, 2)]
+    if not before or not after:
+        return None
+    baseline = [incident_baseline(before, column) for column in (1, 2)]
     pollutant_names = ("PM2.5", "PM10")
     high_levels = (INCIDENT_PM25_HIGH_UGM3, INCIDENT_PM10_HIGH_UGM3)
 
     for column, (value, name) in enumerate(zip(baseline, pollutant_names), start=1):
         transient_threshold = max(value + INCIDENT_TRANSIENT_RISE_UGM3,
-                                  value * INCIDENT_TRANSIENT_RISE_RATIO)
-        if after[0][column] >= transient_threshold:
+                                  value * INCIDENT_TRANSIENT_RISE_RATIO,
+                                  value + 3 * incident_noise_scale(before, column))
+        if before[-1][column] < transient_threshold <= after[0][column]:
             return "Transient %s spike to %.1f µg/m³" % (name, after[0][column])
 
     for column, (high_level, name) in enumerate(zip(high_levels, pollutant_names), start=1):
-        if (before[-1][column] < high_level <= after[0][column]
-                and sum(point[column] >= high_level for point in after) >= 2):
+        if (len(after) >= 2 and before[-1][column] < high_level <= after[0][column]
+                and sum(point[column] >= high_level for point in after[:3]) >= 2):
             return "Sustained %s high level (>= %.1f µg/m³)" % (name, high_level)
 
     for column, (value, name) in enumerate(zip(baseline, pollutant_names), start=1):
-        threshold = max(value + INCIDENT_MIN_RISE_UGM3, value * INCIDENT_MIN_RISE_RATIO)
-        if len(before) < INCIDENT_CONTEXT_N:
+        threshold = max(value + INCIDENT_MIN_RISE_UGM3,
+                        value * INCIDENT_MIN_RISE_RATIO,
+                        value + 2 * incident_noise_scale(before, column))
+        if len(before) < INCIDENT_CONTEXT_N or len(after) < 2:
             continue
-        if (after[0][column] >= threshold
-                and sum(point[column] >= threshold for point in after) >= 2):
+        if (before[-1][column] < threshold <= after[0][column]
+                and sum(point[column] >= threshold for point in after[:3]) >= 2):
             return "Sustained %s rise (>= %.1f µg/m³ and %.2fx baseline)" % (
                 name, INCIDENT_MIN_RISE_UGM3, INCIDENT_MIN_RISE_RATIO)
     return None
@@ -247,11 +264,29 @@ def detect_logged_incidents():
                   and math.isfinite(p[1]) and math.isfinite(p[2])]
     incidents = get_incidents()
     existing_times = [item["ts"] for item in incidents]
-    for index in range(1, len(points) - INCIDENT_CONTEXT_N + 1):
+    sample_updates = []
+    for item in incidents:
+        if not item["reason"]:
+            continue
+        index = next((i for i, point in enumerate(points)
+                      if abs(point[0] - item["ts"]) < 1), None)
+        if index is None:
+            continue
+        samples = {
+            "before": points[max(0, index - INCIDENT_CONTEXT_N):index],
+            "after": points[index:index + INCIDENT_CONTEXT_N],
+        }
+        if samples != item["samples"]:
+            sample_updates.append((json.dumps(samples), item["id"]))
+    if sample_updates:
+        with sqlite3.connect(INCIDENT_DB) as db:
+            db.executemany("UPDATE incidents SET samples = ? WHERE id = ?",
+                           sample_updates)
+
+    for index in range(1, len(points)):
         before = points[max(0, index - INCIDENT_CONTEXT_N):index]
         after = points[index:index + INCIDENT_CONTEXT_N]
-        samples = (before + after if len(before) == INCIDENT_CONTEXT_N
-                   else {"before": before, "after": after})
+        samples = {"before": before, "after": after}
         event_ts = points[index][0]
         reason = incident_rise_detected(samples)
         if reason is None:
@@ -386,12 +421,10 @@ th,td{border:1px solid #8888;padding:.5rem;vertical-align:top}ol{margin:0;paddin
 .note{opacity:.8}.scroll{overflow-x:auto}
 </style></head><body><main>
 <p><a href="/">← Dashboard</a></p><h1>Local air-quality incidents</h1>
-<p class="note">Incidents normally store the three PM2.5/PM10 readings before and after their time.
-For a very large transient, the detector can use fewer available readings before the spike. The sensor logs
-about every 10 minutes, so add an incident manually after the three following readings arrive (about 20 minutes).
-Readings come only from this Pi's SDS011. Records and labels are stored locally
-in ~/incidents.sqlite3 and are not automatically deleted. Select an incident from the last four hours
-of sensor history.</p>
+<p class="note">Automatic transient candidates are saved as soon as the elevated reading arrives; their context
+is filled in as later readings arrive. Manual entries need five readings before and after the selected time.
+The sensor logs about every 10 minutes. Local PM readings are kept for five days; incident records and labels
+are kept in ~/incidents.sqlite3 and are not automatically deleted. Readings come only from this Pi's SDS011.</p>
 %s
 <form class="add" method="post" action="/incidents/add">
 <label>Incident date and time (Pi local time)
@@ -400,14 +433,15 @@ of sensor history.</p>
 <p class="note">The local 3-nearest-neighbour classifier needs at least four labelled examples across
 at least two classes. It predicts only when at least two neighbours agree; early results are experimental
 and are not a fire or safety alarm. Neighbor votes are agreement counts, not calibrated probabilities.
-The app scans its saved four-hour sensor history on startup and checks
-new readings for a rise in PM2.5 or PM10: a single transient must be at least 30 µg/m³ and 2× baseline;
-for this transient, it uses the one to three preceding readings available. Smaller rises must be at least
-10 µg/m³ and 1.25× baseline in two of three readings and require all three baseline readings. A sustained
-crossing to PM2.5 >=35.5 or PM10 >=155 µg/m³ also records a high-level event when two of three readings
-remain high after a lower reading. These short-term thresholds are screening rules, not official AQI
-measurements. All detected events are saved, including undetermined ones. Choose a class or mark a false
-positive NC to exclude it from classifier training; nearby duplicate detections are ignored.</p>
+The app scans its saved five-day local sensor history on startup and after each new reading. It deliberately
+uses sensitive screening rules to collect candidate events. The baseline is the median of up to five previous
+readings; when all five are available, transient and relative-rise rules also account for normal variation
+using median absolute deviation. A single transient is at least 15 µg/m³ and 1.5× baseline; a smaller
+sustained rise is at least 5 µg/m³ and 1.15× baseline in two of three readings; or a sustained crossing to
+PM2.5 >=35.5 or PM10 >=155 µg/m³ remains high in two of three readings. Transient candidates are saved
+immediately and their five-before/five-after context is updated as readings arrive. These thresholds are not
+official AQI measurements. All candidates are saved, including undetermined ones. Choose a class or mark a
+false positive NC to exclude it from classifier training; nearby duplicate detections are ignored.</p>
 <p class="note">%s</p>
 <div class="scroll"><table><thead><tr><th>Incident time</th><th>Detection reason</th><th>Peak summary</th>
 <th>Before<br>(PM2.5 / PM10 µg/m³)</th><th>After<br>(PM2.5 / PM10 µg/m³)</th>
