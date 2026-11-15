@@ -32,7 +32,7 @@ Install the Python dependencies in a virtual environment:
 
 ```sh
 sudo apt update
-sudo apt install -y python3-venv python3-pip libgpiod2
+sudo apt install -y git python3-venv python3-pip
 python3 -m venv ~/venvs/home-lab
 source ~/venvs/home-lab/bin/activate
 python -m pip install --upgrade pip
@@ -208,10 +208,43 @@ app:
 The telemetry archive is appended immediately after each successful local
 sensor reading, so it does not wait for an hourly upload and does not overwrite
 older records. It contains only the Pi's DHT11 and SDS011 readings, not the
-external reference feeds. The archive is local to the Pi and is not pushed to
-GitHub automatically; back it up somewhere private if you need a second copy.
-It starts collecting when this version runs and cannot reconstruct old readings
-that have already expired from the rolling history.
+external reference feeds. It starts collecting when this version runs and
+cannot reconstruct old readings that have already expired from the rolling
+history.
+
+### Publish the archive to a private GitHub repository
+
+The app can mirror `~/telemetry_archive.jsonl` to a separate GitHub repository
+on startup and then hourly. The destination must be a **private** repository:
+the timestamped readings can reveal information about your home. Do not use
+this public source-code repository as the telemetry destination. The Pi keeps
+the local archive and appends only data not already present in the Git copy;
+it refuses to replace a Git archive that is not a prefix of the local file.
+
+The private destination for this project is
+`TeodorTodorovski01/Home-LAB-telemetry`. Add the Pi's public SSH key to this
+repository as a deploy key and enable **Allow write access**. If the Pi does
+not already have a default SSH key, generate one and display only its public
+half:
+
+```sh
+test -f ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -C "home-lab-telemetry"
+cat ~/.ssh/id_ed25519.pub
+```
+
+Add the displayed `.pub` key in the private repository's **Settings → Deploy
+keys**. Never share or upload `~/.ssh/id_ed25519` (the private key). Then start
+the app with its SSH remote:
+
+```sh
+TELEMETRY_GIT_REMOTE=git@github.com:TeodorTodorovski01/Home-LAB-telemetry.git python ~/clock.py
+```
+
+The first successful sync clones the repository to `~/telemetry-git`; you can
+override this with `TELEMETRY_GIT_DIR` and set a non-default branch with
+`TELEMETRY_GIT_BRANCH`. If no remote is configured, uploads are disabled and
+the app prints that status. Git failures are reported in the app terminal and
+retried at the next hourly sync.
 
 The five-day local PM log is scanned after a restart, while the dashboard
 still displays its selected one-to-four-hour graph window. The permanent

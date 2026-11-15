@@ -1,5 +1,5 @@
 cat > ~/clock.py <<'EOF'
-import glob, json, math, os, re, sqlite3, sys, threading, time, urllib.request
+import glob, json, math, os, re, sqlite3, subprocess, sys, threading, time, urllib.request
 from datetime import datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +19,11 @@ GRID_S = 300           # grid every 5 min
 SAVE_S = 300           # save to disk every 5 min (saves the SD card)
 FILE = os.path.expanduser("~/history1m.json")
 TELEMETRY_ARCHIVE_FILE = os.path.expanduser("~/telemetry_archive.jsonl")
+TELEMETRY_GIT_REMOTE = os.environ.get("TELEMETRY_GIT_REMOTE")
+TELEMETRY_GIT_DIR = os.path.expanduser(
+    os.environ.get("TELEMETRY_GIT_DIR", "~/telemetry-git"))
+TELEMETRY_GIT_BRANCH = os.environ.get("TELEMETRY_GIT_BRANCH", "main")
+TELEMETRY_GIT_INTERVAL_S = 3600
 
 # Reference weather: Open-Meteo (weather service MODEL data, not a measurement*), Aerodrom, Skopje
 LAT, LON = 41.98, 21.47
@@ -143,6 +148,89 @@ def append_telemetry(record):
                 f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError as exc:
         print("Telemetry archive write failed: %s" % exc, file=sys.stderr)
+
+def telemetry_git_command(*args):
+    return subprocess.run(
+        ["git", "-C", TELEMETRY_GIT_DIR, *args],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=120)
+
+def sync_telemetry_archive():
+    if not TELEMETRY_GIT_REMOTE:
+        return False
+    if not TELEMETRY_GIT_REMOTE.startswith("git@github.com:") or any(
+            c.isspace() for c in TELEMETRY_GIT_REMOTE):
+        raise ValueError(
+            "Set TELEMETRY_GIT_REMOTE to a GitHub SSH URL; do not put credentials in the URL.")
+    with archive_lock:
+        try:
+            with open(TELEMETRY_ARCHIVE_FILE, "rb") as f:
+                local_archive = f.read()
+        except FileNotFoundError:
+            return False
+    if not local_archive:
+        return False
+
+    git_dir = os.path.abspath(TELEMETRY_GIT_DIR)
+    if os.path.isdir(os.path.join(git_dir, ".git")):
+        telemetry_git_command("fetch", "origin", TELEMETRY_GIT_BRANCH)
+        telemetry_git_command("checkout", TELEMETRY_GIT_BRANCH)
+        telemetry_git_command("pull", "--ff-only", "origin", TELEMETRY_GIT_BRANCH)
+    else:
+        if os.path.exists(git_dir) and os.listdir(git_dir):
+            raise ValueError("Telemetry Git directory exists and is not an empty clone.")
+        os.makedirs(os.path.dirname(git_dir), exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--branch", TELEMETRY_GIT_BRANCH,
+             "--single-branch", TELEMETRY_GIT_REMOTE, git_dir],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=120)
+
+    archive_path = os.path.join(git_dir, "telemetry_archive.jsonl")
+    try:
+        with open(archive_path, "rb") as f:
+            remote_archive = f.read()
+    except FileNotFoundError:
+        remote_archive = b""
+    if not local_archive.startswith(remote_archive):
+        raise ValueError(
+            "Local telemetry does not extend the Git archive; refusing to overwrite it.")
+    if local_archive == remote_archive:
+        return False
+
+    with open(archive_path, "wb") as f:
+        f.write(local_archive)
+    telemetry_git_command("config", "user.name", "Home-LAB telemetry")
+    telemetry_git_command(
+        "config", "user.email", "home-lab-telemetry@users.noreply.github.com")
+    telemetry_git_command("add", "--", "telemetry_archive.jsonl")
+    result = subprocess.run(
+        ["git", "-C", git_dir, "diff", "--cached", "--quiet", "--",
+         "telemetry_archive.jsonl"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    if result.returncode == 0:
+        return False
+    if result.returncode != 1:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr)
+    telemetry_git_command("commit", "-m", "Append Pi telemetry", "--",
+                          "telemetry_archive.jsonl")
+    telemetry_git_command("push", "origin", TELEMETRY_GIT_BRANCH)
+    print("Telemetry archive pushed to Git (%d new bytes)." %
+          (len(local_archive) - len(remote_archive)), file=sys.stderr)
+    return True
+
+def telemetry_git_loop():
+    while True:
+        try:
+            sync_telemetry_archive()
+        except (OSError, ValueError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired) as exc:
+            detail = getattr(exc, "stderr", None)
+            print("Telemetry Git sync failed: %s%s" %
+                  (exc, ("\n" + detail.strip()) if detail else ""),
+                  file=sys.stderr)
+        time.sleep(TELEMETRY_GIT_INTERVAL_S)
 
 def add(t, h):
     now = time.time()
@@ -1281,6 +1369,11 @@ if __name__ == "__main__":
     threading.Thread(target=ref_loop, daemon=True).start()
     threading.Thread(target=pm_reader, daemon=True).start()
     threading.Thread(target=ref_pm_loop, daemon=True).start()
+    if TELEMETRY_GIT_REMOTE:
+        threading.Thread(target=telemetry_git_loop, daemon=True).start()
+    else:
+        print("Telemetry Git sync disabled; set TELEMETRY_GIT_REMOTE to enable it.",
+              file=sys.stderr)
     mirror = ThreadingHTTPServer(("0.0.0.0", 8081), H)     # LAN mirror, no VPN needed
     threading.Thread(target=mirror.serve_forever, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
